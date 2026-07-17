@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Clouder.Core\Clouder.Core.csproj" />
+    <ProjectReference Include="..\Clouder.Storage\Clouder.Storage.csproj" />
+    <ProjectReference Include="..\Clouder.CloudFilter\Clouder.CloudFilter.csproj" />
+    <ProjectReference Include="..\Clouder.Providers.GoogleDrive\Clouder.Providers.GoogleDrive.csproj" />
+    <ProjectReference Include="..\Clouder.Providers.Mega\Clouder.Providers.Mega.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
