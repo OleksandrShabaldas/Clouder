@@ -18,7 +18,9 @@ public sealed class PoolSyncService : IDisposable
     private readonly Dictionary<string, FileSystemWatcher> _watchers = [];
     private readonly ConcurrentDictionary<string, DateTime> _debounce = [];
     private readonly ConcurrentDictionary<string, bool> _syncing = [];
+    private readonly ConcurrentDictionary<string, int> _retryAttempts = [];
     private readonly TimeSpan _debounceDelay = TimeSpan.FromSeconds(2);
+    private const int MaxRetryAttempts = 5;
     private Timer? _debounceTimer;
     private bool _disposed;
 
@@ -115,7 +117,25 @@ public sealed class PoolSyncService : IDisposable
         watcher.Renamed += (_, e) =>
         {
             EnqueueDelete(pool.PoolId, e.OldFullPath);
-            EnqueueSync(pool.PoolId, e.FullPath);
+
+            // A renamed directory fires a single event for the directory itself;
+            // the files inside get no events of their own, so enqueue each one.
+            try
+            {
+                if (Directory.Exists(e.FullPath))
+                {
+                    foreach (var file in Directory.EnumerateFiles(e.FullPath, "*", SearchOption.AllDirectories))
+                        EnqueueSync(pool.PoolId, file);
+                }
+                else
+                {
+                    EnqueueSync(pool.PoolId, e.FullPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Warn($"Failed to enumerate renamed path '{e.FullPath}': {ex.Message}");
+            }
         };
         watcher.Error += (_, e) =>
         {
@@ -167,24 +187,25 @@ public sealed class PoolSyncService : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             var filePath = localFiles[i];
-
-            // Skip hidden/system files and temp files
-            var attrs = File.GetAttributes(filePath);
-            if (attrs.HasFlag(FileAttributes.Hidden) || attrs.HasFlag(FileAttributes.System))
-            {
-                skipped++;
-                continue;
-            }
-
             var fileName = Path.GetFileName(filePath);
-            if (fileName.StartsWith('.') || fileName.StartsWith('~') || fileName.EndsWith(".tmp"))
-            {
-                skipped++;
-                continue;
-            }
 
             try
             {
+                // Skip hidden/system files and temp files. A file can vanish
+                // mid-scan, so even the attribute check belongs inside the try.
+                var attrs = File.GetAttributes(filePath);
+                if (attrs.HasFlag(FileAttributes.Hidden) || attrs.HasFlag(FileAttributes.System))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (fileName.StartsWith('.') || fileName.StartsWith('~') || fileName.EndsWith(".tmp"))
+                {
+                    skipped++;
+                    continue;
+                }
+
                 var relativePath = Path.GetRelativePath(pool.LocalPath, filePath);
                 var existingItem = await FindTrackedFileAsync(pool.PoolId, relativePath, ct);
 
@@ -207,12 +228,19 @@ public sealed class PoolSyncService : IDisposable
                 }
 
                 SyncStatusChanged?.Invoke(poolId, $"Uploading {fileName}...");
-                await _uploadGate.WaitAsync(ct);
-                try { await UploadFileAsync(pool, filePath, ct); }
-                finally { _uploadGate.Release(); }
-                synced++;
-                FileSynced?.Invoke(poolId, fileName, "");
+                var gate = _uploadGate;
+                await gate.WaitAsync(ct);
+                UploadOutcome outcome;
+                try { outcome = await UploadFileAsync(pool, filePath, ct); }
+                finally { gate.Release(); }
+
+                if (outcome == UploadOutcome.Uploaded)
+                    synced++;
+                else
+                    skipped++; // excluded, no provider, or no space — not an upload
             }
+            catch (FileNotFoundException) { skipped++; }
+            catch (DirectoryNotFoundException) { skipped++; }
             catch (Exception ex)
             {
                 ClouderLog.Error($"Failed to sync file '{filePath}'", ex);
@@ -275,7 +303,7 @@ public sealed class PoolSyncService : IDisposable
                     if (action == "sync")
                         await ProcessFileSyncAsync(poolId, filePath);
                     else if (action == "delete")
-                        await ProcessFileDeleteAsync(poolId, filePath);
+                        await HandleLocalDeletionAsync(poolId, filePath);
                 }
                 catch (Exception ex)
                 {
@@ -308,46 +336,102 @@ public sealed class PoolSyncService : IDisposable
         var pool = await _store.GetPoolAsync(poolId);
         if (pool == null) return;
 
+        var retryKey = $"sync|{poolId}|{filePath}";
+        var gate = _uploadGate;
         try
         {
             SyncStatusChanged?.Invoke(poolId, $"Uploading {fileName}...");
-            await UploadFileAsync(pool, filePath);
-            SyncStatusChanged?.Invoke(poolId, $"Uploaded {fileName}");
-            FileSynced?.Invoke(poolId, fileName, "");
-            ClouderLog.Info($"Auto-synced: {fileName} → pool '{pool.Name}'");
+            await gate.WaitAsync();
+            UploadOutcome outcome;
+            try { outcome = await UploadFileAsync(pool, filePath); }
+            finally { gate.Release(); }
+
+            if (outcome == UploadOutcome.Uploaded)
+            {
+                SyncStatusChanged?.Invoke(poolId, $"Uploaded {fileName}");
+                ClouderLog.Info($"Auto-synced: {fileName} → pool '{pool.Name}'");
+            }
+            _retryAttempts.TryRemove(retryKey, out _);
         }
         catch (Exception ex)
         {
             SyncStatusChanged?.Invoke(poolId, $"Failed: {fileName}");
             ClouderLog.Error($"Auto-sync failed for '{filePath}'", ex);
+            ScheduleRetry(retryKey, fileName);
         }
     }
 
-    private async Task ProcessFileDeleteAsync(string poolId, string filePath)
+    /// <summary>
+    /// Re-enqueues a failed upload with exponential backoff (15s, 1m, 4m, capped at 10m).
+    /// After <see cref="MaxRetryAttempts"/> failures the periodic full sweep remains the backstop.
+    /// </summary>
+    private void ScheduleRetry(string key, string fileName)
     {
-        var pool = await _store.GetPoolAsync(poolId);
+        var attempt = _retryAttempts.AddOrUpdate(key, 1, (_, v) => v + 1);
+        if (attempt > MaxRetryAttempts)
+        {
+            _retryAttempts.TryRemove(key, out _);
+            ClouderLog.Warn($"Giving up on '{fileName}' after {MaxRetryAttempts} retries; the periodic sync will try again.");
+            return;
+        }
+
+        var delaySeconds = Math.Min(600, 15 * Math.Pow(4, attempt - 1));
+        // The debounce queue processes entries once "now - value > debounceDelay",
+        // so a future timestamp delays processing by exactly the backoff.
+        _debounce[key] = DateTime.UtcNow + TimeSpan.FromSeconds(delaySeconds);
+        ClouderLog.Warn($"Upload of '{fileName}' failed — retry {attempt}/{MaxRetryAttempts} in {delaySeconds:F0}s");
+    }
+
+    /// <summary>
+    /// Propagates a local deletion to the cloud. Handles both a single file and a
+    /// deleted directory (whose children never get their own watcher events).
+    /// </summary>
+    public async Task HandleLocalDeletionAsync(string poolId, string filePath, CancellationToken ct = default)
+    {
+        var pool = await _store.GetPoolAsync(poolId, ct);
         if (pool == null) return;
 
         var relativePath = Path.GetRelativePath(pool.LocalPath, filePath);
-        var tracked = await FindTrackedFileAsync(poolId, relativePath);
-        if (tracked == null) return;
 
-        try
+        var tracked = await FindTrackedFileAsync(poolId, relativePath, ct);
+        if (tracked != null)
         {
-            await DeleteCloudCopyAsync(tracked);
-            await _store.DeleteItemAsync(tracked.Id);
-            ClouderLog.Info($"Deleted from cloud: {tracked.Name}");
-            SyncStatusChanged?.Invoke(poolId, $"Deleted {tracked.Name}");
+            try
+            {
+                await DeleteCloudCopyAsync(tracked, ct);
+                await _store.DeleteItemAsync(tracked.Id, ct);
+                ClouderLog.Info($"Deleted from cloud: {tracked.Name}");
+                SyncStatusChanged?.Invoke(poolId, $"Deleted {tracked.Name}");
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error($"Failed to delete cloud file '{tracked.Name}'", ex);
+            }
         }
-        catch (Exception ex)
+
+        // The deleted path may have been a folder: remove everything tracked beneath it.
+        var prefix = $"{poolId}|{relativePath}{Path.DirectorySeparatorChar}";
+        var children = await _store.GetItemsByIdPrefixAsync(prefix, ct);
+        foreach (var child in children)
         {
-            ClouderLog.Error($"Failed to delete cloud file '{tracked.Name}'", ex);
+            try
+            {
+                await DeleteCloudCopyAsync(child, ct);
+                await _store.DeleteItemAsync(child.Id, ct);
+                ClouderLog.Info($"Deleted from cloud (folder removal): {child.Name}");
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error($"Failed to delete cloud file '{child.Name}'", ex);
+            }
         }
+        if (children.Count > 0)
+            SyncStatusChanged?.Invoke(poolId, $"Deleted folder {relativePath} ({children.Count} file(s))");
     }
 
     // ── Upload logic ────────────────────────────────────────────────────
 
-    private async Task UploadFileAsync(StoragePool pool, string localFilePath, CancellationToken ct = default)
+    private async Task<UploadOutcome> UploadFileAsync(StoragePool pool, string localFilePath, CancellationToken ct = default)
     {
         var fileName = Path.GetFileName(localFilePath);
         var fileInfo = new FileInfo(localFilePath);
@@ -364,14 +448,17 @@ public sealed class PoolSyncService : IDisposable
             SyncStatusChanged?.Invoke(pool.PoolId,
                 $"Cannot upload {fileName}: no connected accounts. Reconnect on the Accounts page.");
             ClouderLog.Warn($"Skipping '{fileName}': no connected provider for pool '{pool.Name}'");
-            return;
+            return UploadOutcome.NoProvider;
         }
 
-        // If this file was already uploaded, remove the old cloud copy (or chunks)
-        // first so an edit replaces it instead of creating a duplicate.
+        // If this file was uploaded before, snapshot the old cloud location(s) now.
+        // The old copy is deleted only AFTER the replacement upload succeeds, so a
+        // failed upload can never destroy the sole cloud copy. (The snapshot matters:
+        // the store rows are overwritten by the new upload before we delete.)
         var existing = await FindTrackedFileAsync(pool.PoolId, relativePath, ct);
-        if (existing != null)
-            await DeleteCloudCopyAsync(existing, ct);
+        IReadOnlyList<StripePlan> existingPlans = existing != null
+            ? await _store.GetStripePlansAsync(existing.Id, ct)
+            : [];
 
         // Force striping for very large files if the user set a threshold.
         bool forceStripe = StripeThresholdBytes > 0 && fileSize > StripeThresholdBytes
@@ -387,7 +474,8 @@ public sealed class PoolSyncService : IDisposable
             if (forcedPlans.Count >= 2)
             {
                 await UploadStripedAsync(pool, localFilePath, fileName, relativePath, forcedPlans, ct);
-                return;
+                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                return UploadOutcome.Uploaded;
             }
         }
 
@@ -395,58 +483,156 @@ public sealed class PoolSyncService : IDisposable
         {
             case PlacementOutcome.DirectPlace when decision.TargetAccountId != null:
                 await UploadToAccountAsync(pool, decision.TargetAccountId, localFilePath, fileName, relativePath, ct);
-                break;
+                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                return UploadOutcome.Uploaded;
 
             case PlacementOutcome.StripingRequired when decision.StripePlans is { Count: > 0 }:
                 await UploadStripedAsync(pool, localFilePath, fileName, relativePath, decision.StripePlans, ct);
-                break;
+                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                return UploadOutcome.Uploaded;
 
             case PlacementOutcome.InsufficientSpace:
-                if (AutoReorganizeOnFull)
+                // The old copy of this same file may be what's occupying the space.
+                // Delete it first (the data is safe in the local file) and re-decide.
+                if (existing != null)
                 {
-                    SyncStatusChanged?.Invoke(pool.PoolId, $"Pool full — reorganizing to fit {fileName}...");
-                    try
+                    await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                    existing = null;
+                    existingPlans = [];
+                    var redecide = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
+                    if (redecide is { Outcome: PlacementOutcome.DirectPlace, TargetAccountId: not null })
                     {
-                        var reorg = await _poolManager.PlanReorganizationAsync(pool.PoolId, fileSize, ct);
-                        if (reorg.Moves.Count > 0)
-                        {
-                            await _poolManager.ExecuteReorganizationAsync(reorg, null, ct);
-                            // Retry once after freeing space.
-                            var retry = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
-                            if (retry is { Outcome: PlacementOutcome.DirectPlace, TargetAccountId: not null })
-                            {
-                                await UploadToAccountAsync(pool, retry.TargetAccountId, localFilePath, fileName, relativePath, ct);
-                                break;
-                            }
-                            if (retry is { Outcome: PlacementOutcome.StripingRequired, StripePlans: { Count: > 0 } sp })
-                            {
-                                await UploadStripedAsync(pool, localFilePath, fileName, relativePath, sp, ct);
-                                break;
-                            }
-                        }
+                        await UploadToAccountAsync(pool, redecide.TargetAccountId, localFilePath, fileName, relativePath, ct);
+                        return UploadOutcome.Uploaded;
                     }
-                    catch (Exception ex)
+                    if (redecide is { Outcome: PlacementOutcome.StripingRequired, StripePlans: { Count: > 0 } rsp })
                     {
-                        ClouderLog.Error($"Auto-reorg before uploading '{fileName}' failed", ex);
+                        await UploadStripedAsync(pool, localFilePath, fileName, relativePath, rsp, ct);
+                        return UploadOutcome.Uploaded;
                     }
                 }
+                if (await TryReorgAndUploadAsync(pool, localFilePath, fileName, fileSize, relativePath, relativeDir, ct))
+                    return UploadOutcome.Uploaded;
                 ClouderLog.Warn($"Insufficient space to upload '{fileName}' to pool '{pool.Name}'");
                 SyncStatusChanged?.Invoke(pool.PoolId, $"No space for {fileName}");
-                break;
+                return UploadOutcome.NoSpace;
 
             case PlacementOutcome.Excluded:
                 ClouderLog.Debug($"File '{fileName}' excluded by rules");
-                break;
+                return UploadOutcome.Excluded;
+
+            case PlacementOutcome.ReorgRequired when decision.ReorgPlan is { Moves.Count: > 0 } && AutoReorganizeOnFull:
+                // No single member can take the file as-is, but shuffling existing
+                // files frees enough room. Execute the plan, then place normally.
+                SyncStatusChanged?.Invoke(pool.PoolId, $"Reorganizing pool to fit {fileName}...");
+                try
+                {
+                    await _poolManager.ExecuteReorganizationAsync(decision.ReorgPlan, null, ct);
+                    var afterReorg = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
+                    if (afterReorg is { Outcome: PlacementOutcome.DirectPlace, TargetAccountId: not null })
+                    {
+                        await UploadToAccountAsync(pool, afterReorg.TargetAccountId, localFilePath, fileName, relativePath, ct);
+                        await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                        return UploadOutcome.Uploaded;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ClouderLog.Error($"Reorganization before uploading '{fileName}' failed", ex);
+                }
+                goto default;
 
             default:
-                // ReorgRequired or fallback — just upload to highest priority member with space
+                // Fallback — upload to the highest priority enabled member.
                 var fallbackMember = pool.Members
                     .Where(m => m.IsEnabled)
                     .OrderBy(m => m.Priority)
                     .FirstOrDefault();
                 if (fallbackMember != null)
+                {
                     await UploadToAccountAsync(pool, fallbackMember.AccountId, localFilePath, fileName, relativePath, ct);
-                break;
+                    await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                    return UploadOutcome.Uploaded;
+                }
+                return UploadOutcome.NoSpace;
+        }
+    }
+
+    /// <summary>Auto-reorganize to free space, then retry the placement once. True if uploaded.</summary>
+    private async Task<bool> TryReorgAndUploadAsync(
+        StoragePool pool, string localFilePath, string fileName, long fileSize,
+        string relativePath, string? relativeDir, CancellationToken ct)
+    {
+        if (!AutoReorganizeOnFull) return false;
+
+        SyncStatusChanged?.Invoke(pool.PoolId, $"Pool full — reorganizing to fit {fileName}...");
+        try
+        {
+            var reorg = await _poolManager.PlanReorganizationAsync(pool.PoolId, fileSize, ct);
+            if (reorg.Moves.Count == 0) return false;
+
+            await _poolManager.ExecuteReorganizationAsync(reorg, null, ct);
+
+            var retry = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
+            if (retry is { Outcome: PlacementOutcome.DirectPlace, TargetAccountId: not null })
+            {
+                await UploadToAccountAsync(pool, retry.TargetAccountId, localFilePath, fileName, relativePath, ct);
+                return true;
+            }
+            if (retry is { Outcome: PlacementOutcome.StripingRequired, StripePlans: { Count: > 0 } sp })
+            {
+                await UploadStripedAsync(pool, localFilePath, fileName, relativePath, sp, ct);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error($"Auto-reorg before uploading '{fileName}' failed", ex);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Deletes the pre-replacement cloud copy captured before an upload. Uses only the
+    /// in-memory snapshot — the store rows already describe the NEW copy by the time
+    /// this runs, so nothing is re-read (and stripe plans in the store are not touched).
+    /// Failures are logged, never thrown: worst case is a stray extra copy, not data loss.
+    /// </summary>
+    private async Task DeleteReplacedCopyAsync(
+        CloudItem? oldItem, IReadOnlyList<StripePlan> oldPlans, CancellationToken ct = default)
+    {
+        if (oldItem == null) return;
+
+        if (oldPlans.Count > 0)
+        {
+            foreach (var plan in oldPlans)
+            {
+                if (string.IsNullOrEmpty(plan.RemoteId)) continue;
+                try
+                {
+                    var account = await _store.GetAccountAsync(plan.AccountId, ct);
+                    var provider = account != null ? _providers.GetProvider(account.ProviderId) : null;
+                    if (provider != null)
+                        await provider.DeleteAsync(plan.AccountId, plan.RemoteId, ct);
+                }
+                catch (Exception ex)
+                {
+                    ClouderLog.Warn($"Could not delete replaced chunk {plan.ChunkIndex} of '{oldItem.Name}': {ex.Message}");
+                }
+            }
+        }
+        else
+        {
+            try
+            {
+                var provider = _providers.GetProvider(oldItem.ProviderId);
+                if (provider != null)
+                    await provider.DeleteAsync(oldItem.AccountId, oldItem.RemoteId, ct);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Warn($"Could not delete replaced copy of '{oldItem.Name}': {ex.Message}");
+            }
         }
     }
 
@@ -494,6 +680,10 @@ public sealed class PoolSyncService : IDisposable
         };
 
         await _store.UpsertItemAsync(item, ct);
+
+        // If a previous version of this file was striped, its plan rows would now
+        // describe chunks that no longer back this item — clear them.
+        await _store.SaveStripeePlansAsync(item.Id, [], ct);
 
         // Update quota after upload
         try
@@ -1012,6 +1202,19 @@ internal sealed class ThrottledReadStream : Stream
 }
 
 // ── Progress model ──────────────────────────────────────────────────
+
+/// <summary>What actually happened to a file handed to the upload pipeline.</summary>
+public enum UploadOutcome
+{
+    /// <summary>The file (or all its stripe chunks) reached the cloud.</summary>
+    Uploaded,
+    /// <summary>No member account's provider is connected; nothing was attempted.</summary>
+    NoProvider,
+    /// <summary>A file rule excluded this file.</summary>
+    Excluded,
+    /// <summary>The pool has no room even after reorganization.</summary>
+    NoSpace
+}
 
 public sealed class SyncProgress
 {

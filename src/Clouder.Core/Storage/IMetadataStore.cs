@@ -12,6 +12,8 @@ public interface IMetadataStore : IAsyncDisposable
     Task<CloudItem> UpsertItemAsync(CloudItem item, CancellationToken ct = default);
     Task DeleteItemAsync(string itemId, CancellationToken ct = default);
     Task<IReadOnlyList<CloudItem>> GetItemsByAccountAsync(string accountId, CancellationToken ct = default);
+    /// <summary>Items whose id starts with the given prefix (e.g. "poolId|folder\") — used for folder-level operations.</summary>
+    Task<IReadOnlyList<CloudItem>> GetItemsByIdPrefixAsync(string idPrefix, CancellationToken ct = default);
 
     // Accounts
     Task<ProviderAccount?> GetAccountAsync(string accountId, CancellationToken ct = default);

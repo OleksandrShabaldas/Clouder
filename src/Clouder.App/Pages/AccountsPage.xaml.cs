@@ -106,7 +106,9 @@ public sealed partial class AccountsPage : Page
                     && App.Providers.GetProvider("google-drive") == null)
             {
                 await ShowErrorAsync("Reconnect failed",
-                    "No saved Google credentials found. Please reconnect this Google account using Connect Google Drive.");
+                    "No saved Google OAuth credentials found. Use \"Set API Credentials\" to enter your "
+                    + "Client ID and Secret once — all existing Google accounts will reconnect "
+                    + "without being re-added.");
             }
             await RefreshAccountsAsync();
         }
@@ -300,6 +302,92 @@ public sealed partial class AccountsPage : Page
         finally
         {
             AddGoogleBtn.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Saves the Google OAuth Client ID/Secret without connecting a new account,
+    /// then reconnects every existing Google account. This is the recovery path for
+    /// accounts that were connected before credential persistence existed: their
+    /// refresh tokens are still on disk, only the client credentials are missing.
+    /// </summary>
+    private async void SetGoogleCreds_Click(object sender, RoutedEventArgs e)
+    {
+        var clientIdBox = new TextBox { Header = "Client ID", PlaceholderText = "paste Client ID here" };
+        var clientSecretBox = new PasswordBox { Header = "Client Secret", PlaceholderText = "paste Client Secret here" };
+
+        // Pre-fill the Client ID if credentials are already saved.
+        var saved = await App.Connection.LoadGoogleCredentialsAsync();
+        if (saved != null)
+            clientIdBox.Text = saved.Value.ClientId;
+
+        var content = new StackPanel
+        {
+            Spacing = 12,
+            Children =
+            {
+                BuildInfoBar(
+                    "Restore access to existing Google accounts.",
+                    "Enter the OAuth Client ID and Secret from your Google Cloud project (the same ones "
+                    + "used when the accounts were first connected). Saved tokens on this PC will be "
+                    + "reused — no browser sign-in and no duplicate accounts."),
+                BuildFieldWithPaste(clientIdBox),
+                BuildFieldWithPaste(clientSecretBox)
+            }
+        };
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Set Google API Credentials",
+            Content = new ScrollViewer { Content = content, MaxHeight = 400, Padding = new Thickness(0, 0, 12, 0) },
+            PrimaryButtonText = "Save & Reconnect",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        var clientId = clientIdBox.Text?.Trim() ?? "";
+        var clientSecret = clientSecretBox.Password?.Trim() ?? "";
+        var (cidValid, cidErr) = InputValidator.ValidateNotEmpty(clientId, "Client ID");
+        var (secValid, secErr) = InputValidator.ValidateNotEmpty(clientSecret, "Client Secret");
+        if (!cidValid) { await ShowErrorAsync("Validation", cidErr!); return; }
+        if (!secValid) { await ShowErrorAsync("Validation", secErr!); return; }
+
+        SetGoogleCredsBtn.IsEnabled = false;
+        try
+        {
+            await App.Connection.SaveGoogleCredentialsAsync(clientId, clientSecret);
+
+            // Register the provider from the new credentials, then verify each account.
+            await App.Connection.ReconnectAllAsync();
+            await RefreshAccountsAsync();
+
+            var accounts = await App.Store.GetAllAccountsAsync();
+            int okCount = 0, failCount = 0;
+            foreach (var acc in accounts.Where(a => a.ProviderId == "google-drive"))
+            {
+                if (await App.Connection.VerifyAccountAsync(acc)) okCount++;
+                else failCount++;
+            }
+            await RefreshAccountsAsync();
+
+            var summary = $"{okCount} Google account(s) reconnected.";
+            if (failCount > 0)
+                summary += $"\n{failCount} account(s) still failing — their saved tokens may be stale "
+                         + "or belong to a different Google Cloud project. Reconnect those with "
+                         + "Connect Google Drive.";
+            await ShowSuccessAsync("Credentials saved", summary);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error("Failed to save Google credentials", ex);
+            await ShowErrorAsync("Failed", ex.Message);
+        }
+        finally
+        {
+            SetGoogleCredsBtn.IsEnabled = true;
         }
     }
 

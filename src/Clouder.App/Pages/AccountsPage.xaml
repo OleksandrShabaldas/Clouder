@@ -37,6 +37,13 @@
                     <TextBlock Text="Refresh Quotas" />
                 </StackPanel>
             </Button>
+            <Button x:Name="SetGoogleCredsBtn" Click="SetGoogleCreds_Click"
+                    ToolTipService.ToolTip="Enter your Google OAuth Client ID/Secret to restore existing accounts without re-adding them">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <FontIcon Glyph="&#xE192;" FontSize="14" />
+                    <TextBlock Text="Set API Credentials" />
+                </StackPanel>
+            </Button>
         </StackPanel>
 
         <!-- Account List -->

@@ -400,8 +400,9 @@ public sealed partial class PoolsPage : Page
                             new TextBlock { Text = "Stripe Everything", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold },
                             new TextBlock
                             {
-                                Text = "Split all files across member accounts for redundancy. "
-                                     + "Each file will be broken into chunks stored on different drives.",
+                                Text = "Split every file into chunks stored on different accounts. "
+                                     + "Warning: this is NOT redundancy — if any one account is lost, "
+                                     + "its chunks (and thus the whole file) become unreadable.",
                                 TextWrapping = TextWrapping.Wrap, FontSize = 12,
                                 Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
                             }

@@ -266,6 +266,22 @@ public sealed class SqliteMetadataStore : IMetadataStore
         return results;
     }
 
+    public async Task<IReadOnlyList<CloudItem>> GetItemsByIdPrefixAsync(string idPrefix, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        // substr comparison instead of LIKE so %, _ and \ in file names need no escaping
+        cmd.CommandText = "SELECT * FROM items WHERE substr(id, 1, @len) = @prefix ORDER BY id";
+        cmd.Parameters.AddWithValue("@len", idPrefix.Length);
+        cmd.Parameters.AddWithValue("@prefix", idPrefix);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<CloudItem>();
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadItem(reader));
+        return results;
+    }
+
     // ── Accounts ─────────────────────────────────────────────────────────
 
     public async Task<ProviderAccount?> GetAccountAsync(string accountId, CancellationToken ct = default)
@@ -761,6 +777,16 @@ public sealed class SqliteMetadataStore : IMetadataStore
         return conn;
     }
 
+    /// <summary>
+    /// Timestamps are stored as round-trip ("o") UTC strings. Plain DateTime.Parse
+    /// would convert them to LOCAL time on read, shifting every timestamp by the
+    /// UTC offset — which made "was this file modified since last sync?" checks
+    /// wrongly skip any edit made within that offset. RoundtripKind preserves UTC.
+    /// </summary>
+    private static DateTime ParseUtc(string value) =>
+        DateTime.Parse(value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime();
+
     private static async Task ExecuteNonQueryAsync(SqliteConnection conn, string sql, CancellationToken ct)
     {
         await using var cmd = conn.CreateCommand();
@@ -807,8 +833,8 @@ public sealed class SqliteMetadataStore : IMetadataStore
         ContentHash = reader.IsDBNull(reader.GetOrdinal("content_hash"))
             ? null
             : reader.GetString(reader.GetOrdinal("content_hash")),
-        CreatedAtUtc = DateTime.Parse(reader.GetString(reader.GetOrdinal("created_at_utc"))),
-        ModifiedAtUtc = DateTime.Parse(reader.GetString(reader.GetOrdinal("modified_at_utc")))
+        CreatedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("created_at_utc"))),
+        ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc")))
     };
 
     private static ProviderAccount ReadAccount(SqliteDataReader reader)
@@ -832,7 +858,7 @@ public sealed class SqliteMetadataStore : IMetadataStore
                 ? null
                 : reader.GetString(reader.GetOrdinal("email")),
             IsEnabled = reader.GetInt32(reader.GetOrdinal("is_enabled")) == 1,
-            ConnectedAtUtc = DateTime.Parse(reader.GetString(reader.GetOrdinal("connected_at_utc"))),
+            ConnectedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("connected_at_utc"))),
             Quota = totalBytes > 0
                 ? new StorageQuota { TotalBytes = totalBytes, UsedBytes = usedBytes }
                 : null
@@ -855,7 +881,7 @@ public sealed class SqliteMetadataStore : IMetadataStore
         Body = reader.GetString(reader.GetOrdinal("body")),
         Source = reader.GetString(reader.GetOrdinal("source")),
         Severity = (NotificationSeverity)reader.GetInt32(reader.GetOrdinal("severity")),
-        TimestampUtc = DateTime.Parse(reader.GetString(reader.GetOrdinal("timestamp_utc"))),
+        TimestampUtc = ParseUtc(reader.GetString(reader.GetOrdinal("timestamp_utc"))),
         IsRead = reader.GetInt32(reader.GetOrdinal("is_read")) == 1,
         ActionUrl = reader.IsDBNull(reader.GetOrdinal("action_url")) ? null : reader.GetString(reader.GetOrdinal("action_url")),
         RelatedAccountId = reader.IsDBNull(reader.GetOrdinal("related_account_id")) ? null : reader.GetString(reader.GetOrdinal("related_account_id"))
@@ -887,7 +913,7 @@ public sealed class SqliteMetadataStore : IMetadataStore
         ImapUsername = reader.IsDBNull(reader.GetOrdinal("imap_username")) ? null : reader.GetString(reader.GetOrdinal("imap_username")),
         ImapPasswordProtected = reader.IsDBNull(reader.GetOrdinal("imap_password_protected")) ? null : (byte[])reader["imap_password_protected"],
         IsEnabled = reader.GetInt32(reader.GetOrdinal("is_enabled")) == 1,
-        LastCheckedUtc = reader.IsDBNull(reader.GetOrdinal("last_checked_utc")) ? null : DateTime.Parse(reader.GetString(reader.GetOrdinal("last_checked_utc"))),
+        LastCheckedUtc = reader.IsDBNull(reader.GetOrdinal("last_checked_utc")) ? null : ParseUtc(reader.GetString(reader.GetOrdinal("last_checked_utc"))),
         CheckIntervalMinutes = reader.GetInt32(reader.GetOrdinal("check_interval_minutes"))
     };
 
@@ -897,7 +923,7 @@ public sealed class SqliteMetadataStore : IMetadataStore
         RemoteVersionId = reader.GetString(reader.GetOrdinal("remote_version_id")),
         FileId = reader.GetString(reader.GetOrdinal("file_id")),
         Size = reader.GetInt64(reader.GetOrdinal("size")),
-        ModifiedAtUtc = DateTime.Parse(reader.GetString(reader.GetOrdinal("modified_at_utc"))),
+        ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc"))),
         ModifiedBy = reader.IsDBNull(reader.GetOrdinal("modified_by"))
             ? null
             : reader.GetString(reader.GetOrdinal("modified_by"))

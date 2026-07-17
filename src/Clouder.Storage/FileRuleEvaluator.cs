@@ -1,3 +1,5 @@
+using System.Globalization;
+using Clouder.Core.Logging;
 using Clouder.Core.Models;
 
 namespace Clouder.Storage;
@@ -9,8 +11,16 @@ public static class FileRuleEvaluator
     {
         foreach (var rule in rules.Where(r => r.IsEnabled).OrderByDescending(r => r.Priority))
         {
-            if (Matches(rule, fileName, fileSize, folderPath))
-                return rule;
+            try
+            {
+                if (Matches(rule, fileName, fileSize, folderPath))
+                    return rule;
+            }
+            catch (Exception ex)
+            {
+                // A malformed pattern must never abort placement — skip the rule.
+                ClouderLog.Warn($"File rule '{rule.Name}' has an invalid pattern '{rule.Pattern}' — skipped ({ex.Message})");
+            }
         }
         return null;
     }
@@ -39,13 +49,17 @@ public static class FileRuleEvaluator
     public static long ParseSizeBytes(string pattern)
     {
         var s = pattern.Trim().ToUpperInvariant();
-        if (s.EndsWith("TB")) return long.Parse(s[..^2]) * 1024L * 1024 * 1024 * 1024;
-        if (s.EndsWith("GB")) return long.Parse(s[..^2]) * 1024L * 1024 * 1024;
-        if (s.EndsWith("MB")) return long.Parse(s[..^2]) * 1024L * 1024;
-        if (s.EndsWith("KB")) return long.Parse(s[..^2]) * 1024L;
-        if (s.EndsWith("B")) return long.Parse(s[..^1]);
-        return long.Parse(s) * 1024L * 1024; // Default unit: MB
+        if (s.EndsWith("TB")) return Mul(s[..^2], 1024L * 1024 * 1024 * 1024);
+        if (s.EndsWith("GB")) return Mul(s[..^2], 1024L * 1024 * 1024);
+        if (s.EndsWith("MB")) return Mul(s[..^2], 1024L * 1024);
+        if (s.EndsWith("KB")) return Mul(s[..^2], 1024L);
+        if (s.EndsWith("B")) return Mul(s[..^1], 1L);
+        return Mul(s, 1024L * 1024); // Default unit: MB
     }
+
+    // Decimal sizes like "1.5GB" are valid.
+    private static long Mul(string number, long unit) =>
+        (long)(double.Parse(number, NumberStyles.Float, CultureInfo.InvariantCulture) * unit);
 
     private static bool MatchesPath(string pattern, string path)
     {

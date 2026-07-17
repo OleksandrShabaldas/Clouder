@@ -111,37 +111,72 @@ public sealed class StoragePoolManager : IStoragePoolManager
     public async Task ExecuteReorganizationAsync(
         ReorganizationPlan plan, IProgress<ReorgProgress>? progress = null, CancellationToken ct = default)
     {
-        var totalBytes = plan.Moves.Sum(m => GetMoveSize(m));
+        long totalBytes = 0;
+        foreach (var m in plan.Moves)
+        {
+            var it = await _store.GetItemAsync(m.FileId, ct);
+            totalBytes += it?.Size ?? 0;
+        }
+
         long transferred = 0;
+        int failures = 0;
 
         for (int i = 0; i < plan.Moves.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
             var move = plan.Moves[i];
-            var item = await _store.GetItemAsync(move.FileId, ct)
-                ?? throw new InvalidOperationException($"Item '{move.FileId}' not found during reorg");
 
-            var sourceProvider = _providers.GetProvider(item.ProviderId)
-                ?? throw new InvalidOperationException($"Provider '{item.ProviderId}' not found");
+            try
+            {
+                var item = await _store.GetItemAsync(move.FileId, ct)
+                    ?? throw new InvalidOperationException($"Item '{move.FileId}' not found during reorg");
 
-            var destAccount = await _store.GetAccountAsync(move.ToAccountId, ct)
-                ?? throw new InvalidOperationException($"Account '{move.ToAccountId}' not found");
-            var destProvider = _providers.GetProvider(destAccount.ProviderId)
-                ?? throw new InvalidOperationException($"Provider '{destAccount.ProviderId}' not found");
+                var sourceProvider = _providers.GetProvider(item.ProviderId)
+                    ?? throw new InvalidOperationException($"Provider '{item.ProviderId}' not found");
 
-            await using var stream = await sourceProvider.DownloadAsync(move.FromAccountId, item.RemoteId, ct);
+                var destAccount = await _store.GetAccountAsync(move.ToAccountId, ct)
+                    ?? throw new InvalidOperationException($"Account '{move.ToAccountId}' not found");
+                var destProvider = _providers.GetProvider(destAccount.ProviderId)
+                    ?? throw new InvalidOperationException($"Provider '{destAccount.ProviderId}' not found");
 
-            var parentRemoteId = await ResolveDestinationFolderAsync(destProvider, move.ToAccountId, item, ct);
-            var uploaded = await destProvider.UploadAsync(move.ToAccountId, parentRemoteId, item.Name, stream, ct);
+                // The item row is mutated below, so capture the source location first.
+                var sourceRemoteId = item.RemoteId;
 
-            item.RemoteId = uploaded.RemoteId;
-            item.AccountId = move.ToAccountId;
-            item.ProviderId = destAccount.ProviderId;
-            await _store.UpsertItemAsync(item, ct);
+                await using (var stream = await sourceProvider.DownloadAsync(move.FromAccountId, sourceRemoteId, ct))
+                {
+                    var parentRemoteId = await ResolveDestinationFolderAsync(destProvider, move.ToAccountId, item, ct);
+                    var uploaded = await destProvider.UploadAsync(move.ToAccountId, parentRemoteId, item.Name, stream, ct);
 
-            await sourceProvider.DeleteAsync(move.FromAccountId, move.FileId, ct);
+                    item.RemoteId = uploaded.RemoteId;
+                    item.AccountId = move.ToAccountId;
+                    item.ProviderId = destAccount.ProviderId;
+                    await _store.UpsertItemAsync(item, ct);
+                }
 
-            transferred += item.Size;
+                // Delete the source copy last, so any failure above leaves a
+                // duplicate (harmless) rather than a missing file.
+                try
+                {
+                    await sourceProvider.DeleteAsync(move.FromAccountId, sourceRemoteId, ct);
+                }
+                catch (Exception ex)
+                {
+                    Clouder.Core.Logging.ClouderLog.Warn(
+                        $"Reorg: moved '{item.Name}' but could not delete the source copy: {ex.Message}");
+                }
+
+                transferred += item.Size;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failures++;
+                Clouder.Core.Logging.ClouderLog.Error($"Reorg move failed for '{move.FileId}'", ex);
+            }
+
             progress?.Report(new ReorgProgress
             {
                 TotalMoves = plan.Moves.Count,
@@ -150,6 +185,10 @@ public sealed class StoragePoolManager : IStoragePoolManager
                 TransferredBytes = transferred
             });
         }
+
+        if (failures > 0)
+            Clouder.Core.Logging.ClouderLog.Warn(
+                $"Reorganization finished with {failures} failed move(s) out of {plan.Moves.Count}");
     }
 
     /// <summary>
@@ -386,12 +425,6 @@ public sealed class StoragePoolManager : IStoragePoolManager
         }
 
         return (pool, members, quotas);
-    }
-
-    private long GetMoveSize(FileMove move)
-    {
-        var item = _store.GetItemAsync(move.FileId).GetAwaiter().GetResult();
-        return item?.Size ?? 0;
     }
 
     private Task<string> ResolveDestinationFolderAsync(
