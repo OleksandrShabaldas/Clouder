@@ -80,7 +80,15 @@
   <PropertyGroup>
     <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
     <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+
+    <!--
+      Trimming is OFF deliberately. A trimmed Release publish crashes on launch:
+      the linker sets System.Text.Json.JsonSerializer.IsReflectionEnabledByDefault=false,
+      which breaks ConfigService and the DPAPI credential store (both use reflection-based
+      JsonSerializer), and it strips XAML-activated types that WinUI resolves by reflection.
+      Re-enabling this requires JSON source generators plus a trim-safe XAML audit;
+      for a personal app the ~90 MB saved is not worth the breakage.
+    -->
+    <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 </Project>
