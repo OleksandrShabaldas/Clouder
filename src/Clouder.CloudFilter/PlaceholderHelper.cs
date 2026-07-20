@@ -137,7 +137,11 @@ public static class PlaceholderHelper
 
                 if (hr.Failed)
                 {
-                    ClouderLog.Warn($"Could not convert '{filePath}' to a placeholder: {hr}");
+                    // A file that is already a placeholder (e.g. renamed from one, or
+                    // converted by a previous run) reports INVALID_REQUEST. That's a
+                    // no-op, not a problem — the caller still marks it in sync.
+                    ClouderLog.Debug($"'{filePath}' was not converted to a placeholder: {hr} "
+                                   + "(usually means it already is one)");
                     return false;
                 }
                 return true;

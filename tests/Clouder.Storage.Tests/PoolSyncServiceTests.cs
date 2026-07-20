@@ -134,6 +134,48 @@ public class PoolSyncServiceTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task ReconcilePlaceholders_MarksFilesSyncedBeforeExplorerWasEnabled()
+    {
+        await SetupPoolAsync();
+        var provider = new InMemoryCloudProvider();
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(provider));
+
+        // Upload while Explorer integration is OFF — the file is tracked and up to date,
+        // so it will never re-upload and OnUploaded will never fire for it again.
+        await File.WriteAllTextAsync(Path.Combine(_poolDir, "early.txt"), "synced before");
+        await svc.SyncPoolAsync("p1");
+        Assert.NotNull(await _store.GetItemAsync("p1|early.txt"));
+
+        // Now switch Explorer integration on.
+        var sink = new FakePlaceholderSink { ActivePool = "p1" };
+        svc.Placeholders = sink;
+
+        var reconciled = await svc.ReconcilePlaceholdersAsync("p1");
+
+        Assert.Equal(1, reconciled);
+        var marked = Assert.Single(sink.Uploaded);
+        Assert.Equal(Path.Combine(_poolDir, "early.txt"), marked.LocalPath);
+        Assert.Equal("p1|early.txt", marked.ItemId);
+    }
+
+    [Fact]
+    public async Task ReconcilePlaceholders_SkipsWhenExplorerIsOff()
+    {
+        await SetupPoolAsync();
+        var provider = new InMemoryCloudProvider();
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(provider));
+
+        await File.WriteAllTextAsync(Path.Combine(_poolDir, "early.txt"), "synced");
+        await svc.SyncPoolAsync("p1");
+
+        // No sink at all, and a sink bound to a different pool: both are no-ops.
+        Assert.Equal(0, await svc.ReconcilePlaceholdersAsync("p1"));
+
+        svc.Placeholders = new FakePlaceholderSink { ActivePool = "other-pool" };
+        Assert.Equal(0, await svc.ReconcilePlaceholdersAsync("p1"));
+    }
+
+    [Fact]
     public async Task Uploads_LandUnderThePoolsOwnRemoteFolder()
     {
         await SetupPoolAsync();

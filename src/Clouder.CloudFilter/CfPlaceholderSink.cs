@@ -65,9 +65,17 @@ public sealed class CfPlaceholderSink : IPlaceholderSink
             if (!File.Exists(localFilePath)) return;
 
             // Convert first (a plain file isn't a placeholder yet); if it already is one,
-            // conversion fails harmlessly and marking it in sync is what matters.
-            PlaceholderHelper.ConvertToPlaceholder(localFilePath, itemId);
-            PlaceholderHelper.MarkInSync(localFilePath);
+            // conversion is a no-op and marking it in sync is what actually matters —
+            // that's what clears Explorer's "Sync pending" status.
+            bool converted = PlaceholderHelper.ConvertToPlaceholder(localFilePath, itemId);
+            bool marked = PlaceholderHelper.MarkInSync(localFilePath);
+
+            if (marked)
+                ClouderLog.Debug($"'{Path.GetFileName(localFilePath)}' marked in sync"
+                               + (converted ? " (converted to placeholder)" : ""));
+            else
+                ClouderLog.Warn($"Explorer still shows '{Path.GetFileName(localFilePath)}' as pending: "
+                              + "the file could not be marked in sync.");
         }
         catch (Exception ex)
         {

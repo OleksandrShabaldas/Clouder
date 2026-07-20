@@ -31,6 +31,14 @@ public partial class App : Application
     private MainWindow? _window;
     private static MainWindow? _windowRef;
 
+    // ── Single instance ─────────────────────────────────────────────────
+    // Two copies would run two sets of file watchers and tray icons against the
+    // same database and pool folders, racing each other.
+    private const string SingleInstanceMutexName = @"Local\Clouder.SingleInstance";
+    private const string ShowWindowEventName = @"Local\Clouder.ShowWindow";
+    private static Mutex? _singleInstanceMutex;
+    private static EventWaitHandle? _showWindowEvent;
+
     public App()
     {
         InitializeComponent();
@@ -40,6 +48,14 @@ public partial class App : Application
 
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
     {
+        // If Clouder is already running, wake that instance's window and quit.
+        if (!TryClaimSingleInstance())
+        {
+            ClouderLog.Info("Another instance is already running — bringing it to the front");
+            Environment.Exit(0);
+            return;
+        }
+
         try
         {
             ClouderLog.Info("Clouder starting (single process)");
@@ -115,6 +131,89 @@ public partial class App : Application
         // Verify provider connections in the background (refreshes tokens/quota).
         // Then start file sync watchers once connections are confirmed.
         _ = VerifyAndStartSyncAsync();
+    }
+
+    /// <summary>
+    /// Claims the single-instance mutex. Returns false if another Clouder is already
+    /// running, having signalled it to show its window first.
+    /// </summary>
+    private static bool TryClaimSingleInstance()
+    {
+        try
+        {
+            _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool isFirstInstance);
+
+            if (!isFirstInstance)
+            {
+                // Nudge the running instance, then let this one exit.
+                try
+                {
+                    if (EventWaitHandle.TryOpenExisting(ShowWindowEventName, out var existing))
+                    {
+                        using (existing) existing.Set();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ClouderLog.Debug($"Could not signal the running instance: {ex.Message}");
+                }
+
+                _singleInstanceMutex.Dispose();
+                _singleInstanceMutex = null;
+                return false;
+            }
+
+            StartShowWindowListener();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // Never let the guard itself stop the app from starting.
+            ClouderLog.Error("Single-instance check failed; starting anyway", ex);
+            return true;
+        }
+    }
+
+    /// <summary>Waits for a second launch to signal us, and restores the window when it does.</summary>
+    private static void StartShowWindowListener()
+    {
+        _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowWindowEventName);
+
+        var listener = new Thread(() =>
+        {
+            while (true)
+            {
+                try
+                {
+                    if (_showWindowEvent == null) return;
+                    _showWindowEvent.WaitOne();
+
+                    var window = _windowRef;
+                    window?.DispatcherQueue.TryEnqueue(() =>
+                    {
+                        try
+                        {
+                            window.AppWindow.Show();
+                            window.Activate();
+                        }
+                        catch (Exception ex)
+                        {
+                            ClouderLog.Debug($"Could not restore the window: {ex.Message}");
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    ClouderLog.Debug($"Show-window listener stopped: {ex.Message}");
+                    return;
+                }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ClouderShowWindowListener"
+        };
+        listener.Start();
     }
 
     // ── Config application ──────────────────────────────────────────────
@@ -288,6 +387,11 @@ public partial class App : Application
             PlaceholderSink.Activate(pool.PoolId);
             Tray?.UpdateStatus(Engines.Count, false);
             ClouderLog.Info($"Explorer integration active for pool: {pool.Name}");
+
+            // Files synced before the integration was switched on are ordinary files as
+            // far as Explorer is concerned, and would sit at "Sync pending" forever.
+            if (SyncService != null)
+                await SyncService.ReconcilePlaceholdersAsync(pool.PoolId);
         }
         catch (Exception ex)
         {
@@ -446,6 +550,16 @@ public partial class App : Application
         foreach (var engine in Engines)
             engine.Dispose();
         Tray.Dispose();
+
+        // Release the single-instance claim so the next launch starts cleanly.
+        try
+        {
+            _showWindowEvent?.Dispose();
+            _singleInstanceMutex?.ReleaseMutex();
+            _singleInstanceMutex?.Dispose();
+        }
+        catch { /* already gone */ }
+
         _window?.Close();
         Environment.Exit(0);
     }

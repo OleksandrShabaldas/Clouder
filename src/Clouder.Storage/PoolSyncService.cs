@@ -311,6 +311,54 @@ public sealed class PoolSyncService : IDisposable
         ClouderLog.Info($"Pool '{pool.Name}' sync: {synced} uploaded, {skipped} skipped, {failed} failed out of {total}");
     }
 
+    /// <summary>
+    /// Brings already-synced local files under Explorer's cloud-file model: converts them
+    /// to placeholders and marks them in sync.
+    ///
+    /// Without this, any file uploaded before Explorer integration was switched on sits at
+    /// "Sync pending" forever — it's already up to date, so it never re-uploads, and
+    /// <see cref="Clouder.Core.Sync.IPlaceholderSink.OnUploaded"/> only fires on upload.
+    /// Called when a pool's sync root connects.
+    /// </summary>
+    public async Task<int> ReconcilePlaceholdersAsync(string poolId, CancellationToken ct = default)
+    {
+        var sink = Placeholders;
+        if (sink == null || !sink.IsActiveFor(poolId)) return 0;
+
+        var pool = await _store.GetPoolAsync(poolId, ct);
+        if (pool == null) return 0;
+
+        var prefix = poolId + "|";
+        var tracked = await _store.GetItemsByIdPrefixAsync(prefix, ct);
+        int reconciled = 0;
+
+        foreach (var item in tracked)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (item.Type != CloudItemType.File) continue;
+
+            var relativePath = item.Id[prefix.Length..];
+            var localPath = Path.Combine(pool.LocalPath, relativePath);
+            if (!File.Exists(localPath)) continue;
+
+            try
+            {
+                SuppressLocalWrites(localPath, TimeSpan.FromSeconds(30));
+                sink.OnUploaded(poolId, localPath, item.Id);
+                reconciled++;
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Debug($"Could not reconcile '{relativePath}' with Explorer: {ex.Message}");
+            }
+        }
+
+        if (reconciled > 0)
+            ClouderLog.Info($"Marked {reconciled} existing file(s) as cloud-backed in pool '{pool.Name}'");
+
+        return reconciled;
+    }
+
     // ── Debounced file sync ────────────────────────────────────────────
 
     private void EnqueueSync(string poolId, string filePath)
@@ -725,12 +773,18 @@ public sealed class PoolSyncService : IDisposable
             targetFolderId = await EnsureCloudFolderAsync(provider, accountId, targetFolderId, relativeDir, ct);
         }
 
-        // Upload the file (throttled if a speed cap is configured)
-        await using var fileStream = File.OpenRead(localFilePath);
-        Stream stream = MaxUploadBytesPerSec > 0
-            ? new ThrottledReadStream(fileStream, MaxUploadBytesPerSec)
-            : fileStream;
-        var uploaded = await provider.UploadAsync(accountId, targetFolderId, fileName, stream, ct);
+        // Upload the file (throttled if a speed cap is configured).
+        // Scoped so our read handle is closed before anything else touches the file:
+        // converting it to an Explorer placeholder below fails with
+        // ERROR_CLOUD_FILE_INVALID_REQUEST while this process still holds it open.
+        CloudItem uploaded;
+        await using (var fileStream = File.OpenRead(localFilePath))
+        {
+            Stream stream = MaxUploadBytesPerSec > 0
+                ? new ThrottledReadStream(fileStream, MaxUploadBytesPerSec)
+                : fileStream;
+            uploaded = await provider.UploadAsync(accountId, targetFolderId, fileName, stream, ct);
+        }
 
         // Track in metadata store
         var item = new CloudItem
