@@ -47,11 +47,22 @@ public sealed class PoolSyncService : IDisposable
     /// <summary>Size (bytes) above which a file is split across accounts. 0 = never.</summary>
     public long StripeThresholdBytes { get; set; }
 
+    /// <summary>Speed limits, shared with the other sync services so caps are global.</summary>
+    public TransferBudget Budget { get; }
+
     /// <summary>Upload throughput cap in bytes/sec. 0 = unlimited.</summary>
-    public long MaxUploadBytesPerSec { get; set; }
+    public long MaxUploadBytesPerSec
+    {
+        get => Budget.Upload.BytesPerSecond;
+        set => Budget.Upload.BytesPerSecond = value;
+    }
 
     /// <summary>Download throughput cap in bytes/sec. 0 = unlimited.</summary>
-    public long MaxDownloadBytesPerSec { get; set; }
+    public long MaxDownloadBytesPerSec
+    {
+        get => Budget.Download.BytesPerSecond;
+        set => Budget.Download.BytesPerSecond = value;
+    }
 
     /// <summary>When true, an upload that runs out of space triggers a reorganization and one retry.</summary>
     public bool AutoReorganizeOnFull { get; set; } = true;
@@ -82,13 +93,47 @@ public sealed class PoolSyncService : IDisposable
         IMetadataStore store,
         IProviderRegistry providers,
         ConflictHandler? conflicts = null,
-        RemoteRootResolver? roots = null)
+        RemoteRootResolver? roots = null,
+        TransferBudget? budget = null)
     {
         _store = store;
         _providers = providers;
         _poolManager = new StoragePoolManager(store, providers);
         _conflicts = conflicts ?? new ConflictHandler(store);
         _roots = roots ?? new RemoteRootResolver(store);
+        Budget = budget ?? new TransferBudget();
+    }
+
+    /// <summary>
+    /// Appends to the transfer history that backs the dashboard's activity feed.
+    /// Never throws: history is diagnostics, and losing a row must not fail a sync.
+    /// </summary>
+    private async Task RecordTransferAsync(
+        string poolId, string? accountId, string fileName, string? relativePath,
+        TransferKind kind, TransferOutcome outcome, long bytes,
+        long startedAtMs, string? error = null, CancellationToken ct = default)
+    {
+        try
+        {
+            await _store.AddTransferAsync(new TransferRecord
+            {
+                TransferId = Guid.NewGuid().ToString("N"),
+                PoolId = poolId,
+                AccountId = accountId,
+                FileName = fileName,
+                RelativePath = relativePath,
+                Kind = kind,
+                Outcome = outcome,
+                Bytes = bytes,
+                DurationMs = Math.Max(0, Environment.TickCount64 - startedAtMs),
+                TimestampUtc = DateTime.UtcNow,
+                Error = error
+            }, ct);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Debug($"Could not record transfer history for '{fileName}': {ex.Message}");
+        }
     }
 
     // ── Watcher suppression (used while the downloader writes locally) ──
@@ -474,6 +519,8 @@ public sealed class PoolSyncService : IDisposable
         {
             SyncStatusChanged?.Invoke(poolId, $"Failed: {fileName}");
             ClouderLog.Error($"Auto-sync failed for '{filePath}'", ex);
+            await RecordTransferAsync(poolId, null, fileName, relativePathForCheck,
+                TransferKind.Upload, TransferOutcome.Failed, 0, Environment.TickCount64, ex.Message);
             ScheduleRetry(retryKey, fileName);
         }
     }
@@ -513,16 +560,21 @@ public sealed class PoolSyncService : IDisposable
         var tracked = await FindTrackedFileAsync(poolId, relativePath, ct);
         if (tracked != null)
         {
+            long deleteStartedMs = Environment.TickCount64;
             try
             {
                 await DeleteCloudCopyAsync(tracked, ct);
                 await _store.DeleteItemAsync(tracked.Id, ct);
                 ClouderLog.Info($"Deleted from cloud: {tracked.Name}");
                 SyncStatusChanged?.Invoke(poolId, $"Deleted {tracked.Name}");
+                await RecordTransferAsync(poolId, tracked.AccountId, tracked.Name, relativePath,
+                    TransferKind.Delete, TransferOutcome.Success, tracked.Size, deleteStartedMs, ct: ct);
             }
             catch (Exception ex)
             {
                 ClouderLog.Error($"Failed to delete cloud file '{tracked.Name}'", ex);
+                await RecordTransferAsync(poolId, tracked.AccountId, tracked.Name, relativePath,
+                    TransferKind.Delete, TransferOutcome.Failed, 0, deleteStartedMs, ex.Message, ct);
             }
         }
 
@@ -765,6 +817,8 @@ public sealed class PoolSyncService : IDisposable
         if (provider == null)
             throw new InvalidOperationException($"Provider '{account.ProviderId}' not registered. Reconnect the account.");
 
+        long startedAtMs = Environment.TickCount64;
+
         // Everything this pool stores lives under its own remote folder.
         var targetFolderId = await ResolveMemberRootAsync(pool, accountId, provider, ct);
         var relativeDir = Path.GetDirectoryName(relativePath);
@@ -781,7 +835,7 @@ public sealed class PoolSyncService : IDisposable
         await using (var fileStream = File.OpenRead(localFilePath))
         {
             Stream stream = MaxUploadBytesPerSec > 0
-                ? new ThrottledReadStream(fileStream, MaxUploadBytesPerSec)
+                ? new ThrottledReadStream(fileStream, Budget.Upload)
                 : fileStream;
             uploaded = await provider.UploadAsync(accountId, targetFolderId, fileName, stream, ct);
         }
@@ -808,18 +862,23 @@ public sealed class PoolSyncService : IDisposable
         // describe chunks that no longer back this item — clear them.
         await _store.SaveStripeePlansAsync(item.Id, [], ct);
 
-        // Update quota after upload
+        // Update quota after upload, and seed the cache with the fresh value so the
+        // next placement decision sees the space this upload just consumed.
         try
         {
             var quota = await provider.GetQuotaAsync(accountId, ct);
             account.Quota = quota;
             await _store.UpsertAccountAsync(account, ct);
+            _poolManager.Quotas.Set(accountId, quota);
         }
-        catch { /* non-critical */ }
+        catch { _poolManager.Quotas.Invalidate(accountId); }
 
         // Let Explorer know this file is now backed by the cloud.
         try { Placeholders?.OnUploaded(pool.PoolId, localFilePath, item.Id); }
         catch (Exception ex) { ClouderLog.Debug($"Placeholder update skipped for '{fileName}': {ex.Message}"); }
+
+        await RecordTransferAsync(pool.PoolId, accountId, fileName, relativePath,
+            TransferKind.Upload, TransferOutcome.Success, item.Size, startedAtMs, ct: ct);
 
         ClouderLog.Info($"Uploaded '{fileName}' → {account.DisplayName} ({account.ProviderId})");
         FileSynced?.Invoke(pool.PoolId, fileName, accountId);
@@ -855,7 +914,7 @@ public sealed class PoolSyncService : IDisposable
             await using (var chunkStream = new ChunkReadStream(localFilePath, plan.Offset, plan.Length))
             {
                 Stream src = MaxUploadBytesPerSec > 0
-                    ? new ThrottledReadStream(chunkStream, MaxUploadBytesPerSec)
+                    ? new ThrottledReadStream(chunkStream, Budget.Upload)
                     : chunkStream;
                 var uploaded = await provider.UploadAsync(plan.AccountId, targetFolderId, chunkName, src, ct);
                 plan.RemoteId = uploaded.RemoteId;
@@ -892,9 +951,10 @@ public sealed class PoolSyncService : IDisposable
                 {
                     acc.Quota = await prov.GetQuotaAsync(accId, ct);
                     await _store.UpsertAccountAsync(acc, ct);
+                    _poolManager.Quotas.Set(accId, acc.Quota);
                 }
             }
-            catch { /* non-critical */ }
+            catch { _poolManager.Quotas.Invalidate(accId); }
         }
 
         ClouderLog.Info($"Striped '{fileName}' into {saved.Count} chunk(s) across accounts");
@@ -990,7 +1050,7 @@ public sealed class PoolSyncService : IDisposable
 
                 await using var chunk = await provider.DownloadAsync(plan.AccountId, plan.RemoteId, ct);
                 Stream chunkSrc = MaxDownloadBytesPerSec > 0
-                    ? new ThrottledReadStream(chunk, MaxDownloadBytesPerSec) : chunk;
+                    ? new ThrottledReadStream(chunk, Budget.Download) : chunk;
                 await chunkSrc.CopyToAsync(output, ct);
             }
         }
@@ -1000,7 +1060,7 @@ public sealed class PoolSyncService : IDisposable
                 ?? throw new InvalidOperationException($"Provider '{item.ProviderId}' not connected");
             await using var src = await provider.DownloadAsync(item.AccountId, item.RemoteId, ct);
             Stream dlSrc = MaxDownloadBytesPerSec > 0
-                ? new ThrottledReadStream(src, MaxDownloadBytesPerSec) : src;
+                ? new ThrottledReadStream(src, Budget.Download) : src;
             await using var output = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
             await dlSrc.CopyToAsync(output, ct);
         }
@@ -1277,22 +1337,20 @@ internal sealed class ChunkReadStream : Stream
 }
 
 /// <summary>
-/// Wraps a readable stream and limits read throughput to a byte/sec cap by
-/// inserting small async delays. Delegates Length/Seek so providers that need
+/// Wraps a readable stream and charges every read against a shared
+/// <see cref="BandwidthLimiter"/>, so a speed limit is a budget across all concurrent
+/// transfers rather than per transfer. Delegates Length/Seek so providers that need
 /// them (e.g. MEGA upload) keep working.
 /// </summary>
 internal sealed class ThrottledReadStream : Stream
 {
     private readonly Stream _inner;
-    private readonly long _bytesPerSec;
-    private long _bytesSinceTick;
-    private long _tickStartMs;
+    private readonly BandwidthLimiter _limiter;
 
-    public ThrottledReadStream(Stream inner, long bytesPerSec)
+    public ThrottledReadStream(Stream inner, BandwidthLimiter limiter)
     {
         _inner = inner;
-        _bytesPerSec = Math.Max(1, bytesPerSec);
-        _tickStartMs = Environment.TickCount64;
+        _limiter = limiter;
     }
 
     public override bool CanRead => true;
@@ -1308,39 +1366,22 @@ internal sealed class ThrottledReadStream : Stream
     public override int Read(byte[] buffer, int offset, int count)
     {
         int read = _inner.Read(buffer, offset, count);
-        ThrottleAsync(read, default).AsTask().GetAwaiter().GetResult();
+        if (read > 0) _limiter.ConsumeAsync(read).AsTask().GetAwaiter().GetResult();
         return read;
     }
 
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
     {
         int read = await _inner.ReadAsync(buffer.AsMemory(offset, count), ct);
-        await ThrottleAsync(read, ct);
+        if (read > 0) await _limiter.ConsumeAsync(read, ct);
         return read;
     }
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
         int read = await _inner.ReadAsync(buffer, ct);
-        await ThrottleAsync(read, ct);
+        if (read > 0) await _limiter.ConsumeAsync(read, ct);
         return read;
-    }
-
-    private async ValueTask ThrottleAsync(int bytes, CancellationToken ct)
-    {
-        _bytesSinceTick += bytes;
-        long elapsedMs = Environment.TickCount64 - _tickStartMs;
-        double expectedMs = _bytesSinceTick * 1000.0 / _bytesPerSec;
-        if (expectedMs > elapsedMs)
-        {
-            int delay = (int)(expectedMs - elapsedMs);
-            if (delay > 0) await Task.Delay(delay, ct);
-        }
-        if (elapsedMs >= 1000)
-        {
-            _tickStartMs = Environment.TickCount64;
-            _bytesSinceTick = 0;
-        }
     }
 
     protected override void Dispose(bool disposing)

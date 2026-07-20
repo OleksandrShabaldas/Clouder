@@ -9,10 +9,17 @@ public sealed class StoragePoolManager : IStoragePoolManager
     private readonly IMetadataStore _store;
     private readonly IProviderRegistry _providers;
 
-    public StoragePoolManager(IMetadataStore store, IProviderRegistry providers)
+    /// <summary>
+    /// Quota lookups are cached because every placement decision queries every member;
+    /// without this, syncing N files costs N × members network round trips.
+    /// </summary>
+    public QuotaCache Quotas { get; }
+
+    public StoragePoolManager(IMetadataStore store, IProviderRegistry providers, QuotaCache? quotas = null)
     {
         _store = store;
         _providers = providers;
+        Quotas = quotas ?? new QuotaCache();
     }
 
     public async Task<PlacementDecision> DecidePlacementAsync(
@@ -164,6 +171,10 @@ public sealed class StoragePoolManager : IStoragePoolManager
                     Clouder.Core.Logging.ClouderLog.Warn(
                         $"Reorg: moved '{item.Name}' but could not delete the source copy: {ex.Message}");
                 }
+
+                // Both accounts just changed size.
+                Quotas.Invalidate(move.FromAccountId);
+                Quotas.Invalidate(move.ToAccountId);
 
                 transferred += item.Size;
             }
@@ -414,7 +425,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
             try
             {
-                quotas[member.AccountId] = await provider.GetQuotaAsync(member.AccountId, ct);
+                quotas[member.AccountId] = await Quotas.GetAsync(provider, member.AccountId, ct);
                 members.Add(member);
             }
             catch (Exception ex)

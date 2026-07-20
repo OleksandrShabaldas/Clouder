@@ -10,9 +10,41 @@ public sealed class MegaProvider : ICloudProvider
     private readonly MegaSettings _settings;
     private readonly Dictionary<string, MegaApiClient> _clients = new();
 
+    // MEGA has no per-item lookup: every operation needs the whole account node tree,
+    // which is a full network fetch. Caching it briefly turns an N-operation sync from
+    // N tree downloads into one. Any operation that changes the tree clears the entry.
+    private readonly Dictionary<string, (IEnumerable<INode> Nodes, long FetchedAtMs)> _nodeCache = new();
+    private static readonly TimeSpan NodeCacheTtl = TimeSpan.FromSeconds(20);
+
     public MegaProvider(MegaSettings settings)
     {
         _settings = settings;
+    }
+
+    private async Task<IEnumerable<INode>> GetNodesCachedAsync(string accountId, MegaApiClient client)
+    {
+        lock (_nodeCache)
+        {
+            if (_nodeCache.TryGetValue(accountId, out var entry)
+                && Environment.TickCount64 - entry.FetchedAtMs <= NodeCacheTtl.TotalMilliseconds)
+            {
+                return entry.Nodes;
+            }
+        }
+
+        var nodes = await client.GetNodesAsync();
+
+        lock (_nodeCache)
+        {
+            _nodeCache[accountId] = (nodes, Environment.TickCount64);
+        }
+        return nodes;
+    }
+
+    /// <summary>Clears the cached node tree after an operation that changed it.</summary>
+    private void InvalidateNodes(string accountId)
+    {
+        lock (_nodeCache) _nodeCache.Remove(accountId);
     }
 
     public string ProviderId => "mega";
@@ -116,7 +148,7 @@ public sealed class MegaProvider : ICloudProvider
     public async Task<CloudItem?> GetItemAsync(string accountId, string remoteId, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var nodes = await client.GetNodesAsync();
+        var nodes = await GetNodesCachedAsync(accountId, client);
         var node = nodes.FirstOrDefault(n => n.Id == remoteId);
         return node == null ? null : MapToCloudItem(node, accountId);
     }
@@ -125,7 +157,7 @@ public sealed class MegaProvider : ICloudProvider
         string accountId, string remoteFolderId, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var nodes = await client.GetNodesAsync();
+        var nodes = await GetNodesCachedAsync(accountId, client);
 
         INode? parent;
         if (remoteFolderId is "root" or "")
@@ -147,7 +179,7 @@ public sealed class MegaProvider : ICloudProvider
     public async Task<Stream> DownloadAsync(string accountId, string remoteId, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var node = await ResolveNodeAsync(client, remoteId);
+        var node = await ResolveNodeAsync(client, accountId, remoteId);
 
         var tempPath = Path.GetTempFileName();
         await client.DownloadFileAsync(node, tempPath);
@@ -162,7 +194,7 @@ public sealed class MegaProvider : ICloudProvider
         // MEGA doesn't support native range downloads.
         // Download to temp file and return a windowed stream.
         var client = await GetClientAsync(accountId);
-        var node = await ResolveNodeAsync(client, remoteId);
+        var node = await ResolveNodeAsync(client, accountId, remoteId);
 
         var tempPath = Path.GetTempFileName();
         await client.DownloadFileAsync(node, tempPath);
@@ -177,24 +209,27 @@ public sealed class MegaProvider : ICloudProvider
         string accountId, string remoteFolderId, string fileName, Stream content, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var parentNode = await ResolveNodeAsync(client, remoteFolderId);
+        var parentNode = await ResolveNodeAsync(client, accountId, remoteFolderId);
         var uploaded = await client.UploadAsync(content, fileName, parentNode);
+        InvalidateNodes(accountId);
         return MapToCloudItem(uploaded, accountId);
     }
 
     public async Task DeleteAsync(string accountId, string remoteId, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var node = await ResolveNodeAsync(client, remoteId);
+        var node = await ResolveNodeAsync(client, accountId, remoteId);
         await client.DeleteAsync(node, moveToTrash: false);
+        InvalidateNodes(accountId);
     }
 
     public async Task<CloudItem> CreateFolderAsync(
         string accountId, string parentRemoteId, string name, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var parentNode = await ResolveNodeAsync(client, parentRemoteId);
+        var parentNode = await ResolveNodeAsync(client, accountId, parentRemoteId);
         var folder = await client.CreateFolderAsync(name, parentNode);
+        InvalidateNodes(accountId);
         return MapToCloudItem(folder, accountId);
     }
 
@@ -202,9 +237,10 @@ public sealed class MegaProvider : ICloudProvider
         string accountId, string remoteId, string newParentRemoteId, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var node = await ResolveNodeAsync(client, remoteId);
-        var dest = await ResolveNodeAsync(client, newParentRemoteId);
+        var node = await ResolveNodeAsync(client, accountId, remoteId);
+        var dest = await ResolveNodeAsync(client, accountId, newParentRemoteId);
         var moved = await client.MoveAsync(node, dest);
+        InvalidateNodes(accountId);
         return MapToCloudItem(moved, accountId);
     }
 
@@ -212,8 +248,9 @@ public sealed class MegaProvider : ICloudProvider
         string accountId, string remoteId, string newName, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var node = await ResolveNodeAsync(client, remoteId);
+        var node = await ResolveNodeAsync(client, accountId, remoteId);
         var renamed = await client.RenameAsync(node, newName);
+        InvalidateNodes(accountId);
         return MapToCloudItem(renamed, accountId);
     }
 
@@ -223,7 +260,7 @@ public sealed class MegaProvider : ICloudProvider
         string accountId, string rootFolderId, string? cursor, CancellationToken ct = default)
     {
         var client = await GetClientAsync(accountId);
-        var nodes = await client.GetNodesAsync();
+        var nodes = await GetNodesCachedAsync(accountId, client);
 
         var root = rootFolderId is "root" or ""
             ? nodes.Single(n => n.Type == NodeType.Root)
@@ -294,9 +331,9 @@ public sealed class MegaProvider : ICloudProvider
         return client;
     }
 
-    private async Task<INode> ResolveNodeAsync(MegaApiClient client, string remoteId)
+    private async Task<INode> ResolveNodeAsync(MegaApiClient client, string accountId, string remoteId)
     {
-        var nodes = await client.GetNodesAsync();
+        var nodes = await GetNodesCachedAsync(accountId, client);
 
         if (remoteId is "root" or "")
             return nodes.Single(n => n.Type == NodeType.Root);

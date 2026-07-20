@@ -58,6 +58,13 @@ public interface IMetadataStore : IAsyncDisposable
     Task<FileConflict> UpsertConflictAsync(FileConflict conflict, CancellationToken ct = default);
     Task DeleteConflictAsync(string conflictId, CancellationToken ct = default);
 
+    // Transfer history (recent activity + dashboard stats)
+    Task AddTransferAsync(TransferRecord record, CancellationToken ct = default);
+    Task<IReadOnlyList<TransferRecord>> GetRecentTransfersAsync(int limit = 50, string? poolId = null, CancellationToken ct = default);
+    Task<TransferStats> GetTransferStatsAsync(DateTime sinceUtc, CancellationToken ct = default);
+    /// <summary>Trims history to the most recent <paramref name="keep"/> records.</summary>
+    Task PruneTransfersAsync(int keep = 2000, CancellationToken ct = default);
+
     // Notifications
     Task<IReadOnlyList<AppNotification>> GetNotificationsAsync(int limit = 50, bool unreadOnly = false, CancellationToken ct = default);
     Task<AppNotification> UpsertNotificationAsync(AppNotification notification, CancellationToken ct = default);

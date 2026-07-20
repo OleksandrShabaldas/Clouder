@@ -36,8 +36,16 @@ public sealed class RemoteSyncService
     private const int MaxPathDepth = 64;
 
     public bool Paused { get; set; }
-    public long MaxDownloadBytesPerSec { get; set; }
     public long MinFreeDiskBytes { get; set; }
+
+    /// <summary>Speed limits, shared with <see cref="PoolSyncService"/> so caps are global.</summary>
+    public TransferBudget Budget { get; }
+
+    public long MaxDownloadBytesPerSec
+    {
+        get => Budget.Download.BytesPerSecond;
+        set => Budget.Download.BytesPerSecond = value;
+    }
 
     public ConflictResolution ConflictPolicy
     {
@@ -56,13 +64,16 @@ public sealed class RemoteSyncService
         IProviderRegistry providers,
         ConflictHandler conflicts,
         RemoteRootResolver roots,
-        PoolSyncService? localSync = null)
+        PoolSyncService? localSync = null,
+        TransferBudget? budget = null)
     {
         _store = store;
         _providers = providers;
         _conflicts = conflicts;
         _roots = roots;
         _localSync = localSync;
+        // Default to the local sync service's budget so both directions share one cap.
+        Budget = budget ?? localSync?.Budget ?? new TransferBudget();
     }
 
     // ── Entry points ────────────────────────────────────────────────────
@@ -394,9 +405,41 @@ public sealed class RemoteSyncService
             return false;
 
         await _store.DeleteConflictAsync(itemId, ct);
+        await RecordTransferAsync(pool.PoolId, member.AccountId, remote.Name, relativePath,
+            TransferKind.Placeholder, TransferOutcome.Success, remote.Size, Environment.TickCount64, ct: ct);
+
         ClouderLog.Info($"'{relativePath}' is available on demand from {member.AccountId}");
         FileDownloaded?.Invoke(pool.PoolId, relativePath);
         return true;
+    }
+
+    /// <summary>Appends to the transfer history. Never throws — history is diagnostics.</summary>
+    private async Task RecordTransferAsync(
+        string poolId, string? accountId, string fileName, string? relativePath,
+        TransferKind kind, TransferOutcome outcome, long bytes,
+        long startedAtMs, string? error = null, CancellationToken ct = default)
+    {
+        try
+        {
+            await _store.AddTransferAsync(new TransferRecord
+            {
+                TransferId = Guid.NewGuid().ToString("N"),
+                PoolId = poolId,
+                AccountId = accountId,
+                FileName = fileName,
+                RelativePath = relativePath,
+                Kind = kind,
+                Outcome = outcome,
+                Bytes = bytes,
+                DurationMs = Math.Max(0, Environment.TickCount64 - startedAtMs),
+                TimestampUtc = DateTime.UtcNow,
+                Error = error
+            }, ct);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Debug($"Could not record transfer history for '{fileName}': {ex.Message}");
+        }
     }
 
     // ── Download ────────────────────────────────────────────────────────
@@ -411,6 +454,7 @@ public sealed class RemoteSyncService
 
         EnsureDiskSpace(localPath, remote.Size);
 
+        long startedAtMs = Environment.TickCount64;
         StatusChanged?.Invoke(pool.PoolId, $"Downloading {remote.Name}...");
 
         // Write to a hidden temp file first: a partially-written file at the real path
@@ -423,7 +467,7 @@ public sealed class RemoteSyncService
             await using (var source = await provider.DownloadAsync(member.AccountId, remote.RemoteId, ct))
             {
                 Stream src = MaxDownloadBytesPerSec > 0
-                    ? new ThrottledReadStream(source, MaxDownloadBytesPerSec)
+                    ? new ThrottledReadStream(source, Budget.Download)
                     : source;
                 await using var dest = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None);
                 await src.CopyToAsync(dest, ct);
@@ -464,6 +508,9 @@ public sealed class RemoteSyncService
 
         // A resolved file is no longer in conflict.
         await _store.DeleteConflictAsync($"{pool.PoolId}|{relativePath}", ct);
+
+        await RecordTransferAsync(pool.PoolId, member.AccountId, remote.Name, relativePath,
+            TransferKind.Download, TransferOutcome.Success, remote.Size, startedAtMs, ct: ct);
 
         ClouderLog.Info($"Downloaded '{relativePath}' from {member.AccountId}");
         FileDownloaded?.Invoke(pool.PoolId, relativePath);

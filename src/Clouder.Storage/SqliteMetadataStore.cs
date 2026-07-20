@@ -189,6 +189,25 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_conflicts_pool ON conflicts(pool_id)", ct);
 
         await ExecuteNonQueryAsync(conn, """
+            CREATE TABLE IF NOT EXISTS transfers (
+                transfer_id TEXT PRIMARY KEY,
+                pool_id TEXT NOT NULL,
+                account_id TEXT,
+                file_name TEXT NOT NULL,
+                relative_path TEXT,
+                kind INTEGER NOT NULL,
+                outcome INTEGER NOT NULL,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                timestamp_utc TEXT NOT NULL,
+                error TEXT
+            )
+            """, ct);
+
+        await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_transfers_time ON transfers(timestamp_utc DESC)", ct);
+        await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_transfers_pool ON transfers(pool_id)", ct);
+
+        await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS email_configs (
                 config_id TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL UNIQUE,
@@ -818,6 +837,125 @@ public sealed class SqliteMetadataStore : IMetadataStore
         LocalSize = reader.GetInt64(reader.GetOrdinal("local_size")),
         RemoteSize = reader.GetInt64(reader.GetOrdinal("remote_size")),
         DetectedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("detected_at_utc")))
+    };
+
+    // ── Transfer history ─────────────────────────────────────────────────
+
+    public async Task AddTransferAsync(TransferRecord record, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO transfers (transfer_id, pool_id, account_id, file_name, relative_path,
+                                   kind, outcome, bytes, duration_ms, timestamp_utc, error)
+            VALUES (@id, @poolId, @accountId, @fileName, @path,
+                    @kind, @outcome, @bytes, @duration, @timestamp, @error)
+            ON CONFLICT(transfer_id) DO NOTHING
+            """;
+        cmd.Parameters.AddWithValue("@id", record.TransferId);
+        cmd.Parameters.AddWithValue("@poolId", record.PoolId);
+        cmd.Parameters.AddWithValue("@accountId", (object?)record.AccountId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@fileName", record.FileName);
+        cmd.Parameters.AddWithValue("@path", (object?)record.RelativePath ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@kind", (int)record.Kind);
+        cmd.Parameters.AddWithValue("@outcome", (int)record.Outcome);
+        cmd.Parameters.AddWithValue("@bytes", record.Bytes);
+        cmd.Parameters.AddWithValue("@duration", record.DurationMs);
+        cmd.Parameters.AddWithValue("@timestamp", record.TimestampUtc.ToString("o"));
+        cmd.Parameters.AddWithValue("@error", (object?)record.Error ?? DBNull.Value);
+
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<TransferRecord>> GetRecentTransfersAsync(
+        int limit = 50, string? poolId = null, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = poolId == null
+            ? "SELECT * FROM transfers ORDER BY timestamp_utc DESC LIMIT @limit"
+            : "SELECT * FROM transfers WHERE pool_id = @poolId ORDER BY timestamp_utc DESC LIMIT @limit";
+        cmd.Parameters.AddWithValue("@limit", limit);
+        if (poolId != null) cmd.Parameters.AddWithValue("@poolId", poolId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<TransferRecord>();
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadTransfer(reader));
+        return results;
+    }
+
+    public async Task<TransferStats> GetTransferStatsAsync(DateTime sinceUtc, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT kind, outcome, COUNT(*), COALESCE(SUM(bytes), 0)
+            FROM transfers
+            WHERE timestamp_utc >= @since
+            GROUP BY kind, outcome
+            """;
+        cmd.Parameters.AddWithValue("@since", sinceUtc.ToString("o"));
+
+        var stats = new TransferStats();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var kind = (TransferKind)reader.GetInt32(0);
+            var outcome = (TransferOutcome)reader.GetInt32(1);
+            int count = reader.GetInt32(2);
+            long bytes = reader.GetInt64(3);
+
+            if (outcome == TransferOutcome.Failed)
+            {
+                stats.Failures += count;
+                continue;
+            }
+            if (outcome != TransferOutcome.Success) continue;
+
+            switch (kind)
+            {
+                case TransferKind.Upload:
+                    stats.Uploads += count;
+                    stats.BytesUploaded += bytes;
+                    break;
+                case TransferKind.Download:
+                    stats.Downloads += count;
+                    stats.BytesDownloaded += bytes;
+                    break;
+            }
+        }
+
+        return stats;
+    }
+
+    public async Task PruneTransfersAsync(int keep = 2000, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM transfers
+            WHERE transfer_id NOT IN (
+                SELECT transfer_id FROM transfers ORDER BY timestamp_utc DESC LIMIT @keep
+            )
+            """;
+        cmd.Parameters.AddWithValue("@keep", keep);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static TransferRecord ReadTransfer(SqliteDataReader reader) => new()
+    {
+        TransferId = reader.GetString(reader.GetOrdinal("transfer_id")),
+        PoolId = reader.GetString(reader.GetOrdinal("pool_id")),
+        AccountId = reader.IsDBNull(reader.GetOrdinal("account_id")) ? null : reader.GetString(reader.GetOrdinal("account_id")),
+        FileName = reader.GetString(reader.GetOrdinal("file_name")),
+        RelativePath = reader.IsDBNull(reader.GetOrdinal("relative_path")) ? null : reader.GetString(reader.GetOrdinal("relative_path")),
+        Kind = (TransferKind)reader.GetInt32(reader.GetOrdinal("kind")),
+        Outcome = (TransferOutcome)reader.GetInt32(reader.GetOrdinal("outcome")),
+        Bytes = reader.GetInt64(reader.GetOrdinal("bytes")),
+        DurationMs = reader.GetInt64(reader.GetOrdinal("duration_ms")),
+        TimestampUtc = ParseUtc(reader.GetString(reader.GetOrdinal("timestamp_utc"))),
+        Error = reader.IsDBNull(reader.GetOrdinal("error")) ? null : reader.GetString(reader.GetOrdinal("error"))
     };
 
     // ── Notifications ────────────────────────────────────────────────────
