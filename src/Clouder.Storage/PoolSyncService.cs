@@ -25,6 +25,12 @@ public sealed class PoolSyncService : IDisposable
 
     private readonly RemoteRootResolver _roots;
     private readonly ConflictHandler _conflicts;
+
+    /// <summary>
+    /// When set and active, uploaded files are converted to cloud-backed placeholders so
+    /// Explorer shows the "in sync" overlay and their space can later be freed.
+    /// </summary>
+    public Clouder.Core.Sync.IPlaceholderSink? Placeholders { get; set; }
     private Timer? _debounceTimer;
     private bool _disposed;
 
@@ -756,6 +762,10 @@ public sealed class PoolSyncService : IDisposable
             await _store.UpsertAccountAsync(account, ct);
         }
         catch { /* non-critical */ }
+
+        // Let Explorer know this file is now backed by the cloud.
+        try { Placeholders?.OnUploaded(pool.PoolId, localFilePath, item.Id); }
+        catch (Exception ex) { ClouderLog.Debug($"Placeholder update skipped for '{fileName}': {ex.Message}"); }
 
         ClouderLog.Info($"Uploaded '{fileName}' → {account.DisplayName} ({account.ProviderId})");
         FileSynced?.Invoke(pool.PoolId, fileName, accountId);

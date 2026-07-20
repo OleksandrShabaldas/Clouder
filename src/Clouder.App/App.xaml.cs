@@ -20,6 +20,8 @@ public partial class App : Application
     public static EmailCheckService? EmailChecker { get; private set; }
     public static PoolSyncService? SyncService { get; private set; }
     public static RemoteSyncService? RemoteSync { get; private set; }
+    public static CfPlaceholderSink? PlaceholderSink { get; private set; }
+    public static HydrationService? Hydration { get; private set; }
     public static ProviderConnectionManager Connection { get; private set; } = null!;
     public static ClouderConfig AppConfig { get; private set; } = new();
 
@@ -67,6 +69,13 @@ public partial class App : Application
             var roots = new RemoteRootResolver(Store);
             SyncService = new PoolSyncService(Store, Providers, conflicts, roots);
             RemoteSync = new RemoteSyncService(Store, Providers, conflicts, roots, SyncService);
+
+            // Explorer integration is opt-in (see ClouderConfig.ExplorerIntegrationEnabled).
+            PlaceholderSink = new CfPlaceholderSink();
+            SyncService.Placeholders = PlaceholderSink;
+            RemoteSync.Placeholders = PlaceholderSink;
+            Hydration = new HydrationService(Store, Providers);
+
             ApplyConfigToSync();
 
             // Apply auto-start preference to the Windows registry.
@@ -135,10 +144,17 @@ public partial class App : Application
     /// <summary>Re-read config from the store and apply everything live. Called by Settings page.</summary>
     public static async Task ReloadConfigAsync()
     {
+        bool explorerWasOn = Engines.Count > 0;
+
         AppConfig = await Config.LoadAsync();
         ApplyConfigToSync();
         ApplyAutoStart(AppConfig.AutoStartOnLogin);
         RestartPeriodicSync();
+
+        if (AppConfig.ExplorerIntegrationEnabled && !explorerWasOn)
+            await EnableExplorerIntegrationAsync();
+        else if (!AppConfig.ExplorerIntegrationEnabled && explorerWasOn)
+            DisableExplorerIntegration();
     }
 
     private static void ApplyAutoStart(bool enabled)
@@ -208,20 +224,70 @@ public partial class App : Application
             null, interval, interval);
     }
 
-    // ── Pool lifecycle (called from UI) ────────────────────────────────
+    // ── Explorer integration (CfApi) — opt-in ──────────────────────────
+
+    /// <summary>
+    /// Registers every pool as a Windows sync root and connects its cloud-filter engine,
+    /// so pool folders appear in Explorer's sidebar with on-demand files.
+    /// Any pool that fails is skipped rather than taking the app down with it.
+    /// </summary>
+    public static async Task EnableExplorerIntegrationAsync()
+    {
+        if (Hydration == null || PlaceholderSink == null) return;
+
+        if (!SyncRootRegistrar.IsSupported())
+        {
+            ClouderLog.Warn("Explorer integration is not supported on this Windows build");
+            return;
+        }
+
+        var pools = await Store.GetAllPoolsAsync();
+        foreach (var pool in pools)
+        {
+            if (Engines.Any(e => e.PoolId == pool.PoolId)) continue;
+
+            try
+            {
+                await ConnectPoolAsync(pool);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error($"Explorer integration failed for pool '{pool.Name}'", ex);
+            }
+        }
+
+        Tray?.UpdateStatus(Engines.Count, false);
+    }
+
+    public static void DisableExplorerIntegration()
+    {
+        foreach (var engine in Engines.ToList())
+        {
+            PlaceholderSink?.Deactivate(engine.PoolId);
+            try { engine.Dispose(); }
+            catch (Exception ex) { ClouderLog.Error($"Error disconnecting pool {engine.PoolId}", ex); }
+        }
+        Engines.Clear();
+        Tray?.UpdateStatus(0, false);
+        ClouderLog.Info("Explorer integration disabled");
+    }
 
     public static async Task ConnectPoolAsync(StoragePool pool)
     {
+        if (Hydration == null || PlaceholderSink == null)
+            throw new InvalidOperationException("Sync services are not initialized.");
+
         try
         {
             if (!SyncRootRegistrar.IsRegistered(pool.PoolId))
                 await SyncRootRegistrar.RegisterAsync(pool.PoolId, pool.Name, pool.LocalPath);
 
-            var engine = new SyncEngine(pool.LocalPath, pool.PoolId, Store, Providers);
+            var engine = new SyncEngine(pool.LocalPath, pool.PoolId, Hydration);
             engine.Connect();
             Engines.Add(engine);
+            PlaceholderSink.Activate(pool.PoolId);
             Tray?.UpdateStatus(Engines.Count, false);
-            ClouderLog.Info($"Pool connected from UI: {pool.Name}");
+            ClouderLog.Info($"Explorer integration active for pool: {pool.Name}");
         }
         catch (Exception ex)
         {
@@ -230,7 +296,7 @@ public partial class App : Application
         }
     }
 
-    public static void DisconnectPool(string poolId)
+    public static void DisconnectPool(string poolId, string? localPath = null)
     {
         var engine = Engines.FirstOrDefault(e => e.PoolId == poolId);
         if (engine != null)
@@ -238,7 +304,8 @@ public partial class App : Application
             engine.Dispose();
             Engines.Remove(engine);
         }
-        SyncRootRegistrar.Unregister(poolId);
+        PlaceholderSink?.Deactivate(poolId);
+        SyncRootRegistrar.Unregister(poolId, localPath);
         Tray?.UpdateStatus(Engines.Count, false);
         ClouderLog.Info($"Pool disconnected: {poolId}");
     }
@@ -276,6 +343,13 @@ public partial class App : Application
         catch (Exception ex)
         {
             ClouderLog.Error("Failed to start pool sync service", ex);
+        }
+
+        // Explorer integration last: it's opt-in and must never block sync from starting.
+        if (AppConfig.ExplorerIntegrationEnabled)
+        {
+            try { await EnableExplorerIntegrationAsync(); }
+            catch (Exception ex) { ClouderLog.Error("Failed to enable Explorer integration", ex); }
         }
 
         // Start periodic health checks (quota warnings, dead-account alerts).

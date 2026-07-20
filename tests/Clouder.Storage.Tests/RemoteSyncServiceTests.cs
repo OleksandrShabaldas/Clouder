@@ -1,7 +1,30 @@
 using Clouder.Core.Models;
+using Clouder.Core.Sync;
 using Clouder.Storage;
 
 namespace Clouder.Storage.Tests;
+
+/// <summary>Stands in for the CfApi placeholder sink, which needs real Explorer to exercise.</summary>
+internal sealed class FakePlaceholderSink : IPlaceholderSink
+{
+    public string ActivePool { get; init; } = "";
+    public bool FailCreation { get; init; }
+
+    public List<(string PoolId, string LocalPath, CloudItem Item)> Created { get; } = [];
+    public List<(string PoolId, string LocalPath, string ItemId)> Uploaded { get; } = [];
+
+    public bool IsActiveFor(string poolId) => poolId == ActivePool;
+
+    public bool TryCreatePlaceholder(string poolId, string localFilePath, CloudItem item)
+    {
+        if (FailCreation) return false;
+        Created.Add((poolId, localFilePath, item));
+        return true;
+    }
+
+    public void OnUploaded(string poolId, string localFilePath, string itemId) =>
+        Uploaded.Add((poolId, localFilePath, itemId));
+}
 
 /// <summary>
 /// Cloud → local sync: remote additions come down, remote deletions remove local
@@ -336,6 +359,72 @@ public class RemoteSyncServiceTests : IAsyncDisposable
         var kept = Assert.Single(Directory.GetFiles(_poolDir, "doc (conflicted copy*.txt"));
         Assert.Equal("local edit", await File.ReadAllTextAsync(kept));
         Assert.Empty(await _store.GetConflictsAsync("p1"));
+    }
+
+    // ── Explorer placeholder mode ───────────────────────────────────────
+
+    [Fact]
+    public async Task PlaceholderMode_RegistersFileWithoutDownloadingContent()
+    {
+        var h = await SetupAsync();
+        var rootId = await EstablishRootAsync(h);
+        await h.Remote.SyncPoolAsync("p1");
+
+        var sink = new FakePlaceholderSink { ActivePool = "p1" };
+        h.Remote.Placeholders = sink;
+
+        h.Provider.PutRemoteFile(rootId, "movie.mkv", "pretend this is 4 GB");
+        var result = await h.Remote.SyncPoolAsync("p1");
+
+        // Made available on demand, not downloaded.
+        Assert.Equal(1, result.Placeholders);
+        Assert.Equal(0, result.Downloaded);
+        Assert.False(File.Exists(Path.Combine(_poolDir, "movie.mkv")),
+            "placeholder mode must not write the file's content locally");
+
+        var placeheld = Assert.Single(sink.Created);
+        Assert.Equal(Path.Combine(_poolDir, "movie.mkv"), placeheld.LocalPath);
+
+        // The item is tracked under the id the placeholder carries, which is what
+        // hydration looks it up by when the user opens the file.
+        var tracked = await _store.GetItemAsync("p1|movie.mkv");
+        Assert.NotNull(tracked);
+        Assert.Equal("p1|movie.mkv", placeheld.Item.Id);
+        Assert.Equal(tracked.RemoteId, placeheld.Item.RemoteId);
+    }
+
+    [Fact]
+    public async Task PlaceholderCreationFailure_FallsBackToDownloading()
+    {
+        var h = await SetupAsync();
+        var rootId = await EstablishRootAsync(h);
+        await h.Remote.SyncPoolAsync("p1");
+
+        h.Remote.Placeholders = new FakePlaceholderSink { ActivePool = "p1", FailCreation = true };
+
+        h.Provider.PutRemoteFile(rootId, "notes.txt", "real content");
+        var result = await h.Remote.SyncPoolAsync("p1");
+
+        Assert.Equal(0, result.Placeholders);
+        Assert.Equal(1, result.Downloaded);
+        Assert.Equal("real content", await File.ReadAllTextAsync(Path.Combine(_poolDir, "notes.txt")));
+    }
+
+    [Fact]
+    public async Task InactivePool_DownloadsNormally()
+    {
+        var h = await SetupAsync();
+        var rootId = await EstablishRootAsync(h);
+        await h.Remote.SyncPoolAsync("p1");
+
+        // Sink present but active for a different pool.
+        h.Remote.Placeholders = new FakePlaceholderSink { ActivePool = "some-other-pool" };
+
+        h.Provider.PutRemoteFile(rootId, "doc.txt", "content");
+        var result = await h.Remote.SyncPoolAsync("p1");
+
+        Assert.Equal(0, result.Placeholders);
+        Assert.Equal(1, result.Downloaded);
     }
 
     [Fact]

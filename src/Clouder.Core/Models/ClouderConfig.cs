@@ -30,4 +30,11 @@ public sealed class ClouderConfig
     // File striping
     public long StripingPromptThresholdMb { get; set; } = 100;
     public bool AutoReorganizeOnFull { get; set; } = true;
+
+    /// <summary>
+    /// Show pools in Explorer's sidebar with on-demand (placeholder) files, via the
+    /// Windows Cloud Files API. Off by default: a faulty cloud-filter provider can hang
+    /// or crash Explorer, so this stays opt-in until verified on the user's machine.
+    /// </summary>
+    public bool ExplorerIntegrationEnabled { get; set; }
 }

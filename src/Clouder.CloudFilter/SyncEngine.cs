@@ -1,39 +1,62 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using Vanara.PInvoke;
 using Clouder.Core.Logging;
-using Clouder.Core.Models;
-using Clouder.Core.Providers;
-using Clouder.Core.Storage;
+using Clouder.Storage;
 using static Vanara.PInvoke.CldApi;
 
 namespace Clouder.CloudFilter;
 
 /// <summary>
-/// Manages the CfApi connection for a sync root. Handles callbacks from Windows
-/// when files are opened (hydration) or folders are browsed (placeholder population).
+/// Hosts the CfApi connection for one pool's sync root and services Windows'
+/// hydration requests: when the user opens a placeholder file, Windows calls
+/// FETCH_DATA and we stream the bytes back from the cloud.
+///
+/// Two rules govern everything here, and breaking either is what made the previous
+/// implementation crash and hang Explorer:
+///   1. Callbacks must return promptly. Work happens on the thread pool and completes
+///      later via CfExecute — never block the filter's callback thread.
+///   2. Every transfer except the final one must be 4096-byte aligned
+///      (see <see cref="AlignedTransfer"/>).
+/// Every callback must also complete exactly once, success or failure, or the calling
+/// application hangs on the file handle forever.
 /// </summary>
 public sealed class SyncEngine : IDisposable
 {
+    private const uint StatusSuccess = 0x00000000;
+    private const uint StatusUnsuccessful = 0xC0000001;
+    private const uint StatusCloudFileUnsuccessful = 0xC000CF07;
+
     private readonly string _syncRootPath;
-    private readonly IMetadataStore _store;
-    private readonly IProviderRegistry _providers;
     private readonly string _poolId;
+    private readonly HydrationService _hydration;
+
     private CF_CONNECTION_KEY _connectionKey;
     private bool _connected;
+    private bool _disposed;
 
-    public string PoolId => _poolId;
+    /// <summary>
+    /// In-flight hydrations, keyed by normalized file path so CANCEL_FETCH_DATA can
+    /// stop a large download the user abandoned. Keying by path (rather than transfer
+    /// key) means two concurrent reads of the same file cancel together; Windows simply
+    /// re-requests, so the cost is a retry rather than a failure.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _inFlight =
+        new(StringComparer.OrdinalIgnoreCase);
 
-    // Must prevent garbage collection of callback delegates
+    // The callback delegates must be kept alive for as long as the connection exists,
+    // or the GC will collect them and Windows will call into freed memory.
     private readonly CF_CALLBACK _fetchDataCallback;
     private readonly CF_CALLBACK _fetchPlaceholdersCallback;
     private readonly CF_CALLBACK _cancelFetchDataCallback;
 
-    public SyncEngine(string syncRootPath, string poolId, IMetadataStore store, IProviderRegistry providers)
+    public string PoolId => _poolId;
+
+    public SyncEngine(string syncRootPath, string poolId, HydrationService hydration)
     {
         _syncRootPath = syncRootPath;
         _poolId = poolId;
-        _store = store;
-        _providers = providers;
+        _hydration = hydration;
 
         _fetchDataCallback = OnFetchData;
         _fetchPlaceholdersCallback = OnFetchPlaceholders;
@@ -59,243 +82,250 @@ public sealed class SyncEngine : IDisposable
             out _connectionKey).ThrowIfFailed("CfConnectSyncRoot failed");
 
         _connected = true;
-        ClouderLog.Info($"SyncEngine connected: {_syncRootPath}");
+        ClouderLog.Info($"Explorer integration connected for pool {_poolId}: {_syncRootPath}");
     }
 
     public void Disconnect()
     {
         if (!_connected) return;
-        CfDisconnectSyncRoot(_connectionKey);
         _connected = false;
+
+        foreach (var cts in _inFlight.Values)
+        {
+            try { cts.Cancel(); } catch { }
+        }
+        _inFlight.Clear();
+
+        try
+        {
+            CfDisconnectSyncRoot(_connectionKey);
+            ClouderLog.Info($"Explorer integration disconnected for pool {_poolId}");
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error($"Failed to disconnect sync root for pool {_poolId}", ex);
+        }
     }
 
-    public void Dispose() => Disconnect();
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Disconnect();
+    }
 
-    // ── Callback: Fetch Data (hydrate a file on demand) ─────────────────
+    // ── FETCH_DATA: the user opened a placeholder; stream its bytes ─────
 
     private void OnFetchData(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParams)
     {
+        // Copy out of the `in` parameters: the structs are only valid for the
+        // duration of the synchronous callback, and the work continues past it.
         var info = callbackInfo;
-        var fetchParams = callbackParams.FetchData;
-        var requiredOffset = fetchParams.RequiredFileOffset;
-        var requiredLength = fetchParams.RequiredLength;
-        var remoteId = ExtractRemoteId(info);
+        var connectionKey = callbackInfo.ConnectionKey;
+        var transferKey = callbackInfo.TransferKey;
+        long requiredOffset = callbackParams.FetchData.RequiredFileOffset;
+        long requiredLength = callbackParams.FetchData.RequiredLength;
+        var itemId = ExtractItemId(info);
+        var pathKey = info.NormalizedPath ?? itemId;
 
-        try
+        var cts = new CancellationTokenSource();
+        _inFlight[pathKey] = cts;
+
+        // Return immediately — the transfer completes asynchronously via CfExecute.
+        _ = Task.Run(async () =>
         {
-            Task.Run(async () =>
-            {
-                try
-                {
-                    var item = await FindItemByRemoteIdAsync(remoteId);
-                    if (item == null) { ReportFailure(info); return; }
-
-                    var provider = _providers.GetProvider(item.ProviderId);
-                    if (provider == null) { ReportFailure(info); return; }
-
-                    await using var stream = await provider.DownloadAsync(item.AccountId, item.RemoteId);
-                    await TransferDataAsync(info, stream, requiredOffset, requiredLength, item.Size);
-                }
-                catch (Exception ex)
-                {
-                    ClouderLog.Error($"FetchData failed for {remoteId}", ex);
-                    try { ReportFailure(info); } catch { }
-                }
-            }).Wait();
-        }
-        catch (Exception ex)
-        {
-            ClouderLog.Error($"FetchData outer failure for {remoteId}", ex);
-        }
-    }
-
-    // ── Callback: Fetch Placeholders (list folder contents) ─────────────
-
-    private void OnFetchPlaceholders(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParams)
-    {
-        var info = callbackInfo;
-        var folderPath = info.NormalizedPath;
-        var remoteId = ExtractRemoteId(info);
-
-        try
-        {
-            Task.Run(async () =>
-            {
-                try
-                {
-                    var pool = await _store.GetPoolAsync(_poolId);
-                    if (pool == null) { ReportSuccess(info); return; }
-
-                    var items = new List<CloudItem>();
-
-                    foreach (var member in pool.Members.Where(m => m.IsEnabled))
-                    {
-                        try
-                        {
-                            var provider = _providers.GetProvider(member.ProviderId);
-                            if (provider == null) continue;
-
-                            var folderId = string.IsNullOrEmpty(remoteId) ? "root" : remoteId;
-                            var memberItems = await provider.ListFolderAsync(member.AccountId, folderId);
-                            items.AddRange(memberItems);
-                        }
-                        catch (Exception ex)
-                        {
-                            ClouderLog.Error($"ListFolder failed for member {member.AccountId}", ex);
-                        }
-                    }
-
-                    if (items.Count > 0)
-                    {
-                        foreach (var item in items)
-                            await _store.UpsertItemAsync(item);
-
-                        var localDir = Path.Combine(_syncRootPath, folderPath?.TrimStart('\\') ?? "");
-                        PlaceholderHelper.CreatePlaceholders(localDir, items);
-                    }
-
-                    ReportSuccess(info);
-                }
-                catch (Exception ex)
-                {
-                    ClouderLog.Error($"FetchPlaceholders failed for folder '{folderPath}'", ex);
-                    try { ReportSuccess(info); } catch { }
-                }
-            }).Wait();
-        }
-        catch (Exception ex)
-        {
-            ClouderLog.Error($"FetchPlaceholders outer failure", ex);
-        }
-    }
-
-    // ── Callback: Cancel ────────────────────────────────────────────────
-
-    private void OnCancelFetchData(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParams)
-    {
-        // Nothing to do — the background download will finish naturally
-    }
-
-    // ── Data transfer ───────────────────────────────────────────────────
-
-    private async Task TransferDataAsync(
-        CF_CALLBACK_INFO callbackInfo, Stream sourceStream,
-        long requiredOffset, long requiredLength, long totalSize)
-    {
-        const int bufferSize = 4 * 1024 * 1024; // 4 MB chunks
-        var buffer = new byte[bufferSize];
-        long currentOffset = requiredOffset;
-        long remaining = Math.Min(requiredLength, totalSize - requiredOffset);
-
-        if (sourceStream.CanSeek)
-            sourceStream.Seek(requiredOffset, SeekOrigin.Begin);
-        else
-        {
-            // Skip bytes if stream isn't seekable
-            long toSkip = requiredOffset;
-            while (toSkip > 0)
-            {
-                int skipped = await sourceStream.ReadAsync(buffer, 0, (int)Math.Min(toSkip, bufferSize));
-                if (skipped == 0) break;
-                toSkip -= skipped;
-            }
-        }
-
-        while (remaining > 0)
-        {
-            int toRead = (int)Math.Min(remaining, bufferSize);
-            int bytesRead = await sourceStream.ReadAsync(buffer, 0, toRead);
-            if (bytesRead == 0) break;
-
-            var pinnedBuffer = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             try
             {
-                var opInfo = new CF_OPERATION_INFO
+                if (string.IsNullOrEmpty(itemId))
                 {
-                    StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-                    Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
-                    ConnectionKey = callbackInfo.ConnectionKey,
-                    TransferKey = callbackInfo.TransferKey
-                };
+                    ClouderLog.Warn("Hydration request carried no file identity; failing the request");
+                    ReportFailure(connectionKey, transferKey, requiredOffset, requiredLength);
+                    return;
+                }
 
-                var opParams = CF_OPERATION_PARAMETERS.Create(
-                    new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                await using var source = await _hydration.OpenRangeAsync(
+                    itemId, requiredOffset, requiredLength, cts.Token);
+
+                long sent = await AlignedTransfer.RunAsync(
+                    source, requiredOffset, requiredLength,
+                    (offset, buffer, count, _) =>
                     {
-                        Buffer = pinnedBuffer.AddrOfPinnedObject(),
-                        Offset = currentOffset,
-                        Length = bytesRead,
-                        Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-                        CompletionStatus = new NTStatus(0) // STATUS_SUCCESS
-                    });
+                        TransferBlock(connectionKey, transferKey, offset, buffer, count);
+                        return Task.CompletedTask;
+                    },
+                    AlignedTransfer.DefaultBlockSize,
+                    cts.Token);
 
-                CfExecute(opInfo, ref opParams).ThrowIfFailed("CfExecute TransferData failed");
+                if (sent < requiredLength)
+                {
+                    // The cloud returned less than Windows asked for; the file handle
+                    // must still be completed or the opening application hangs.
+                    ClouderLog.Warn(
+                        $"Hydration of '{itemId}' returned {sent} of {requiredLength} requested bytes");
+                    ReportFailure(connectionKey, transferKey, requiredOffset + sent, requiredLength - sent);
+                }
+                else
+                {
+                    ClouderLog.Debug($"Hydrated {sent} bytes of '{itemId}' at offset {requiredOffset}");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                ClouderLog.Debug($"Hydration of '{itemId}' cancelled");
+                TryReportFailure(connectionKey, transferKey, requiredOffset, requiredLength);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error($"Hydration failed for '{itemId}'", ex);
+                TryReportFailure(connectionKey, transferKey, requiredOffset, requiredLength);
             }
             finally
             {
-                pinnedBuffer.Free();
+                _inFlight.TryRemove(pathKey, out _);
+                cts.Dispose();
             }
+        });
+    }
 
-            currentOffset += bytesRead;
-            remaining -= bytesRead;
+    private static void TransferBlock(
+        CF_CONNECTION_KEY connectionKey, CF_TRANSFER_KEY transferKey,
+        long offset, byte[] buffer, int count)
+    {
+        var pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        try
+        {
+            var opInfo = new CF_OPERATION_INFO
+            {
+                StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                ConnectionKey = connectionKey,
+                TransferKey = transferKey
+            };
+
+            var opParams = CF_OPERATION_PARAMETERS.Create(
+                new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                {
+                    Buffer = pinned.AddrOfPinnedObject(),
+                    Offset = offset,
+                    Length = count,
+                    Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                    CompletionStatus = new NTStatus(StatusSuccess)
+                });
+
+            CfExecute(opInfo, ref opParams).ThrowIfFailed("CfExecute TransferData failed");
+        }
+        finally
+        {
+            pinned.Free();
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────
+    // ── FETCH_PLACEHOLDERS ──────────────────────────────────────────────
 
-    private static string ExtractRemoteId(in CF_CALLBACK_INFO info)
+    /// <summary>
+    /// Windows asks us to enumerate a directory. Clouder populates placeholders eagerly
+    /// from its own metadata (see PlaceholderHelper), so there is nothing to add here —
+    /// but the callback must still be completed, or Explorer hangs on that folder.
+    /// </summary>
+    private void OnFetchPlaceholders(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParams)
+    {
+        var connectionKey = callbackInfo.ConnectionKey;
+        var transferKey = callbackInfo.TransferKey;
+
+        try
+        {
+            var opInfo = new CF_OPERATION_INFO
+            {
+                StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
+                ConnectionKey = connectionKey,
+                TransferKey = transferKey
+            };
+
+            var opParams = CF_OPERATION_PARAMETERS.Create(
+                new CF_OPERATION_PARAMETERS.TRANSFERPLACEHOLDERS
+                {
+                    Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+                    CompletionStatus = new NTStatus(StatusSuccess),
+                    PlaceholderArray = IntPtr.Zero,
+                    PlaceholderCount = 0,
+                    PlaceholderTotalCount = 0,
+                    EntriesProcessed = 0
+                });
+
+            CfExecute(opInfo, ref opParams);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error("Failed to complete a placeholder enumeration request", ex);
+        }
+    }
+
+    // ── CANCEL_FETCH_DATA ───────────────────────────────────────────────
+
+    private void OnCancelFetchData(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParams)
+    {
+        var pathKey = callbackInfo.NormalizedPath ?? ExtractItemId(callbackInfo);
+        if (string.IsNullOrEmpty(pathKey)) return;
+
+        if (_inFlight.TryGetValue(pathKey, out var cts))
+        {
+            try { cts.Cancel(); } catch { }
+            ClouderLog.Debug($"Windows cancelled hydration of '{pathKey}'");
+        }
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Placeholders carry Clouder's internal item id ("{poolId}|{relativePath}") as their
+    /// file identity. The previous implementation stored the provider's remote id, which
+    /// no uploaded file could ever be looked up by — so those files never hydrated.
+    /// </summary>
+    private static string ExtractItemId(in CF_CALLBACK_INFO info)
     {
         if (info.FileIdentity == IntPtr.Zero || info.FileIdentityLength == 0)
             return "";
 
-        var bytes = new byte[info.FileIdentityLength];
-        Marshal.Copy(info.FileIdentity, bytes, 0, (int)info.FileIdentityLength);
-        return System.Text.Encoding.UTF8.GetString(bytes);
-    }
-
-    private async Task<CloudItem?> FindItemByRemoteIdAsync(string remoteId)
-    {
-        if (string.IsNullOrEmpty(remoteId)) return null;
-        return await _store.GetItemAsync(remoteId);
-    }
-
-    private static void ReportSuccess(in CF_CALLBACK_INFO info)
-    {
-        var opInfo = new CF_OPERATION_INFO
+        try
         {
-            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-            Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DATA,
-            ConnectionKey = info.ConnectionKey,
-            TransferKey = info.TransferKey
-        };
-
-        var opParams = CF_OPERATION_PARAMETERS.Create(
-            new CF_OPERATION_PARAMETERS.ACKDATA
-            {
-                CompletionStatus = new NTStatus(0), // STATUS_SUCCESS
-                Flags = CF_OPERATION_ACK_DATA_FLAGS.CF_OPERATION_ACK_DATA_FLAG_NONE
-            });
-
-        CfExecute(opInfo, ref opParams);
+            var bytes = new byte[info.FileIdentityLength];
+            Marshal.Copy(info.FileIdentity, bytes, 0, (int)info.FileIdentityLength);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error("Could not read the file identity from a hydration request", ex);
+            return "";
+        }
     }
 
-    private static void ReportFailure(in CF_CALLBACK_INFO info)
+    private static void TryReportFailure(
+        CF_CONNECTION_KEY connectionKey, CF_TRANSFER_KEY transferKey, long offset, long length)
+    {
+        try { ReportFailure(connectionKey, transferKey, offset, length); }
+        catch (Exception ex) { ClouderLog.Error("Could not report hydration failure to Windows", ex); }
+    }
+
+    private static void ReportFailure(
+        CF_CONNECTION_KEY connectionKey, CF_TRANSFER_KEY transferKey, long offset, long length)
     {
         var opInfo = new CF_OPERATION_INFO
         {
             StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
             Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
-            ConnectionKey = info.ConnectionKey,
-            TransferKey = info.TransferKey
+            ConnectionKey = connectionKey,
+            TransferKey = transferKey
         };
 
         var opParams = CF_OPERATION_PARAMETERS.Create(
             new CF_OPERATION_PARAMETERS.TRANSFERDATA
             {
-                CompletionStatus = new NTStatus(0xC0000001), // STATUS_UNSUCCESSFUL
+                Buffer = IntPtr.Zero,
+                Offset = offset,
+                Length = length,
                 Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-                Length = 0,
-                Offset = 0,
-                Buffer = IntPtr.Zero
+                CompletionStatus = new NTStatus(StatusCloudFileUnsuccessful)
             });
 
         CfExecute(opInfo, ref opParams);

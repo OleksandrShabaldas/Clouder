@@ -2,6 +2,7 @@ using Clouder.Core.Logging;
 using Clouder.Core.Models;
 using Clouder.Core.Providers;
 using Clouder.Core.Storage;
+using Clouder.Core.Sync;
 
 namespace Clouder.Storage;
 
@@ -22,6 +23,12 @@ public sealed class RemoteSyncService
     private readonly RemoteRootResolver _roots;
     private readonly ConflictHandler _conflicts;
     private readonly PoolSyncService? _localSync;
+
+    /// <summary>
+    /// When set and active for a pool, remote files become on-demand placeholders
+    /// instead of being downloaded. Null (or inactive) means normal downloads.
+    /// </summary>
+    public IPlaceholderSink? Placeholders { get; set; }
 
     /// <summary>Chunk files created by striping — never treated as user files.</summary>
     private const string StripeChunkMarker = ".clpart";
@@ -106,13 +113,15 @@ public sealed class RemoteSyncService
             }
         }
 
-        if (result.Downloaded > 0 || result.DeletedLocally > 0 || result.Conflicts > 0)
+        if (result.Downloaded > 0 || result.Placeholders > 0 || result.DeletedLocally > 0 || result.Conflicts > 0)
         {
             ClouderLog.Info(
                 $"Remote sync for '{pool.Name}': {result.Downloaded} downloaded, "
-                + $"{result.DeletedLocally} deleted locally, {result.Conflicts} conflict(s), {result.Failed} failed");
+                + $"{result.Placeholders} available on demand, {result.DeletedLocally} deleted locally, "
+                + $"{result.Conflicts} conflict(s), {result.Failed} failed");
             StatusChanged?.Invoke(poolId,
-                $"Cloud changes applied: {result.Downloaded} downloaded, {result.DeletedLocally} removed");
+                $"Cloud changes applied: {result.Downloaded + result.Placeholders} new, "
+                + $"{result.DeletedLocally} removed");
         }
 
         return result;
@@ -179,6 +188,7 @@ public sealed class RemoteSyncService
                 switch (outcome)
                 {
                     case ApplyOutcome.Downloaded: result.Downloaded++; break;
+                    case ApplyOutcome.Placeheld: result.Placeholders++; break;
                     case ApplyOutcome.Conflict: result.Conflicts++; break;
                 }
             }
@@ -201,7 +211,7 @@ public sealed class RemoteSyncService
         return result;
     }
 
-    private enum ApplyOutcome { Skipped, Downloaded, Conflict }
+    private enum ApplyOutcome { Skipped, Downloaded, Placeheld, Conflict }
 
     private async Task<ApplyOutcome> ApplyRemoteUpsertAsync(
         StoragePool pool, PoolMember member, ICloudProvider provider,
@@ -227,6 +237,11 @@ public sealed class RemoteSyncService
 
         if (!localChanged)
         {
+            // With Explorer integration on, the file appears immediately as an
+            // on-demand placeholder and its content is fetched when first opened.
+            if (await TryPlaceholderAsync(pool, member, remote, relativePath, localPath, ct))
+                return ApplyOutcome.Placeheld;
+
             await DownloadRemoteFileAsync(pool, member, provider, remote, relativePath, ct);
             return ApplyOutcome.Downloaded;
         }
@@ -335,6 +350,53 @@ public sealed class RemoteSyncService
         }
 
         return removed;
+    }
+
+    /// <summary>
+    /// Records the remote file and exposes it as an on-demand placeholder. Returns false
+    /// when Explorer integration isn't active for this pool (or the placeholder couldn't
+    /// be created), so the caller downloads the content instead.
+    /// </summary>
+    private async Task<bool> TryPlaceholderAsync(
+        StoragePool pool, PoolMember member, CloudItem remote,
+        string relativePath, string localPath, CancellationToken ct)
+    {
+        var sink = Placeholders;
+        if (sink == null || !sink.IsActiveFor(pool.PoolId)) return false;
+
+        var itemId = $"{pool.PoolId}|{relativePath}";
+
+        // The placeholder carries this item id as its identity, so the record has to
+        // exist before Windows can ask us to hydrate it.
+        var item = new CloudItem
+        {
+            Id = itemId,
+            RemoteId = remote.RemoteId,
+            ProviderId = member.ProviderId,
+            AccountId = member.AccountId,
+            Name = remote.Name,
+            ParentId = remote.ParentId,
+            Type = CloudItemType.File,
+            Size = remote.Size,
+            ContentHash = remote.ContentHash,
+            CreatedAtUtc = remote.CreatedAtUtc,
+            ModifiedAtUtc = remote.ModifiedAtUtc,
+            SyncState = Clouder.Core.Models.SyncState.Synced
+        };
+        await _store.UpsertItemAsync(item, ct);
+
+        var directory = Path.GetDirectoryName(localPath);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+        _localSync?.SuppressLocalWrites(localPath, TimeSpan.FromSeconds(30));
+
+        if (!sink.TryCreatePlaceholder(pool.PoolId, localPath, item))
+            return false;
+
+        await _store.DeleteConflictAsync(itemId, ct);
+        ClouderLog.Info($"'{relativePath}' is available on demand from {member.AccountId}");
+        FileDownloaded?.Invoke(pool.PoolId, relativePath);
+        return true;
     }
 
     // ── Download ────────────────────────────────────────────────────────
@@ -552,6 +614,8 @@ public sealed class RemoteSyncService
 public sealed class RemoteSyncResult
 {
     public int Downloaded { get; set; }
+    /// <summary>Files made available on demand as Explorer placeholders (content not fetched).</summary>
+    public int Placeholders { get; set; }
     public int DeletedLocally { get; set; }
     public int Conflicts { get; set; }
     public int Failed { get; set; }
@@ -559,6 +623,7 @@ public sealed class RemoteSyncResult
     public void Add(RemoteSyncResult other)
     {
         Downloaded += other.Downloaded;
+        Placeholders += other.Placeholders;
         DeletedLocally += other.DeletedLocally;
         Conflicts += other.Conflicts;
         Failed += other.Failed;

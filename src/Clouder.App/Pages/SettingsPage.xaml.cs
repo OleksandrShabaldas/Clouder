@@ -51,7 +51,25 @@ public sealed partial class SettingsPage : Page
         StripeThresholdBox.Value = _config.StripingPromptThresholdMb;
         AutoReorgToggle.IsOn = _config.AutoReorganizeOnFull;
 
+        ExplorerToggle.IsOn = _config.ExplorerIntegrationEnabled;
+        UpdateExplorerStatus();
+
         _loading = false;
+    }
+
+    private void UpdateExplorerStatus()
+    {
+        if (!Clouder.CloudFilter.SyncRootRegistrar.IsSupported())
+        {
+            ExplorerToggle.IsEnabled = false;
+            ExplorerStatusText.Text = "This Windows build doesn't support cloud storage providers.";
+            return;
+        }
+
+        ExplorerStatusText.Text = _config.ExplorerIntegrationEnabled
+            ? "Active. Pool folders appear in Explorer's sidebar; files download when you open them. "
+              + "Right-click a file and choose \"Free up space\" to keep it online-only."
+            : "Off. Pool folders are ordinary folders and files are kept fully downloaded.";
     }
 
     private void ReadConfigFromUI()
@@ -75,6 +93,8 @@ public sealed partial class SettingsPage : Page
 
         _config.StripingPromptThresholdMb = (long)StripeThresholdBox.Value;
         _config.AutoReorganizeOnFull = AutoReorgToggle.IsOn;
+
+        _config.ExplorerIntegrationEnabled = ExplorerToggle.IsOn;
     }
 
     private static readonly Dictionary<ConflictResolution, string> ConflictDescriptions = new()
@@ -100,6 +120,7 @@ public sealed partial class SettingsPage : Page
         if (_loading) return;
         ReadConfigFromUI();
         UpdateConflictDescription(_config.ConflictPolicy);
+        UpdateExplorerStatus();
         await _configService.SaveAsync(_config);
         await App.ReloadConfigAsync();   // apply settings live (sync, auto-start, intervals)
         SaveIndicator.Text = $"Saved at {DateTime.Now:HH:mm:ss}";
