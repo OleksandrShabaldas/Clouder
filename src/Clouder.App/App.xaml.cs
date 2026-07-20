@@ -22,6 +22,8 @@ public partial class App : Application
     public static RemoteSyncService? RemoteSync { get; private set; }
     public static CfPlaceholderSink? PlaceholderSink { get; private set; }
     public static HydrationService? Hydration { get; private set; }
+    public static ToastNotifier? Toasts { get; private set; }
+    public static CacheEvictionService? CacheEviction { get; private set; }
     public static ProviderConnectionManager Connection { get; private set; } = null!;
     public static ClouderConfig AppConfig { get; private set; } = new();
 
@@ -91,6 +93,7 @@ public partial class App : Application
             SyncService.Placeholders = PlaceholderSink;
             RemoteSync.Placeholders = PlaceholderSink;
             Hydration = new HydrationService(Store, Providers);
+            CacheEviction = new CacheEvictionService(Store, PlaceholderSink);
 
             ApplyConfigToSync();
 
@@ -115,6 +118,25 @@ public partial class App : Application
             };
             Tray.Start();
             Tray.UpdateStatus(Engines.Count, false);
+
+            Toasts = new ToastNotifier(Tray) { Enabled = AppConfig.ShowNotifications };
+
+            // Conflicts are the one thing that always needs a person, so surface them
+            // the moment they're detected rather than at the next health check.
+            conflicts.ConflictDetected += (poolId, relativePath) =>
+            {
+                Toasts?.Show(new AppNotification
+                {
+                    NotificationId = $"toast-conflict-{poolId}-{relativePath}",
+                    Title = "Sync conflict",
+                    Body = $"\"{Path.GetFileName(relativePath)}\" changed here and in the cloud. "
+                         + "Open Files to choose which copy to keep.",
+                    Source = "sync",
+                    Severity = NotificationSeverity.Warning,
+                    TimestampUtc = DateTime.UtcNow,
+                    IsRead = false
+                });
+            };
         }
         catch (Exception ex)
         {
@@ -234,6 +256,16 @@ public partial class App : Application
             ? AppConfig.MinFreeDiskMb * 1024L * 1024L
             : 0;
 
+        if (Toasts != null) Toasts.Enabled = AppConfig.ShowNotifications;
+
+        if (CacheEviction != null)
+        {
+            CacheEviction.CacheLimitBytes = AppConfig.CacheSizeLimitMb > 0
+                ? AppConfig.CacheSizeLimitMb * 1024L * 1024L
+                : 0;
+            CacheEviction.DehydrateAfterDays = AppConfig.AutoDehydrateDays;
+        }
+
         if (RemoteSync == null) return;
         RemoteSync.ConflictPolicy = AppConfig.ConflictPolicy;
         RemoteSync.MaxDownloadBytesPerSec = AppConfig.MaxDownloadBytesPerSec;
@@ -277,11 +309,27 @@ public partial class App : Application
         }
     }
 
-    /// <summary>Create or store an app notification, honoring the ShowNotifications setting.</summary>
+    /// <summary>
+    /// Records an app notification and, for anything needing attention, raises a
+    /// Windows notification too.
+    ///
+    /// The notification is always stored; ShowNotifications only governs whether it
+    /// interrupts. Suppressing the record as well (the old behaviour) meant turning
+    /// notifications off silently discarded the history of what went wrong.
+    /// </summary>
     public static async Task NotifyAsync(AppNotification notification)
     {
-        if (!AppConfig.ShowNotifications) return;
         await Store.UpsertNotificationAsync(notification);
+
+        if (AppConfig.ShowNotifications)
+            Toasts?.Show(notification);
+
+        try
+        {
+            var unread = await Store.GetUnreadCountAsync();
+            _windowRef?.DispatcherQueue.TryEnqueue(() => _windowRef!.UpdateBadge(unread));
+        }
+        catch { /* badge is cosmetic */ }
     }
 
     /// <summary>
@@ -468,18 +516,14 @@ public partial class App : Application
             try
             {
                 var alerts = await health.RunChecksAsync();
-                int created = 0;
                 foreach (var alert in alerts)
-                {
-                    if (!AppConfig.ShowNotifications) break;
-                    await Store.UpsertNotificationAsync(alert);
-                    created++;
-                }
-                if (created > 0)
-                {
-                    var unread = await Store.GetUnreadCountAsync();
-                    _windowRef?.DispatcherQueue.TryEnqueue(() => _windowRef!.UpdateBadge(unread));
-                }
+                    await NotifyAsync(alert);   // stores, toasts if enabled, updates the badge
+
+                // Housekeeping on the same hourly tick: free local disk for files that
+                // are safely in the cloud, and keep transfer history from growing forever.
+                if (CacheEviction != null)
+                    await CacheEviction.RunAsync();
+                await Store.PruneTransfersAsync();
             }
             catch (Exception ex)
             {

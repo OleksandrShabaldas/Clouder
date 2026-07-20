@@ -38,6 +38,21 @@ public sealed class TrayIcon : IDisposable
         try { _icon.Text = text; } catch { }
     }
 
+    /// <summary>Pops a notification balloon from the tray icon.</summary>
+    public void ShowBalloon(string title, string message, bool isError)
+    {
+        if (_icon == null) return;
+        try
+        {
+            // Windows truncates these itself, but trimming keeps them readable.
+            _icon.BalloonTipTitle = title.Length <= 63 ? title : title[..60] + "...";
+            _icon.BalloonTipText = message;
+            _icon.BalloonTipIcon = isError ? ToolTipIcon.Error : ToolTipIcon.Warning;
+            _icon.ShowBalloonTip(10_000);
+        }
+        catch { /* the shell can refuse balloons; never worth failing over */ }
+    }
+
     public void Dispose()
     {
         if (_icon != null)

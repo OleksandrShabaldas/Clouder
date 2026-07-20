@@ -12,8 +12,16 @@ internal sealed class FakePlaceholderSink : IPlaceholderSink
 
     public List<(string PoolId, string LocalPath, CloudItem Item)> Created { get; } = [];
     public List<(string PoolId, string LocalPath, string ItemId)> Uploaded { get; } = [];
+    public List<string> Freed { get; } = [];
 
     public bool IsActiveFor(string poolId) => poolId == ActivePool;
+
+    public bool TryFreeSpace(string poolId, string localFilePath)
+    {
+        if (!IsActiveFor(poolId)) return false;
+        Freed.Add(localFilePath);
+        return true;
+    }
 
     public bool TryCreatePlaceholder(string poolId, string localFilePath, CloudItem item)
     {

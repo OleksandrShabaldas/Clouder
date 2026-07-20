@@ -56,6 +56,21 @@ public sealed class CfPlaceholderSink : IPlaceholderSink
         }
     }
 
+    public bool TryFreeSpace(string poolId, string localFilePath)
+    {
+        if (!IsActiveFor(poolId)) return false;
+
+        try
+        {
+            return File.Exists(localFilePath) && PlaceholderHelper.Dehydrate(localFilePath);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Debug($"Could not free space for '{localFilePath}': {ex.Message}");
+            return false;
+        }
+    }
+
     public void OnUploaded(string poolId, string localFilePath, string itemId)
     {
         if (!IsActiveFor(poolId)) return;

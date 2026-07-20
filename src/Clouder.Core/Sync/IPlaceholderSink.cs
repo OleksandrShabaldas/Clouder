@@ -25,4 +25,11 @@ public interface IPlaceholderSink
     /// cloud (enabling the "in sync" overlay and later "free up space").
     /// </summary>
     void OnUploaded(string poolId, string localFilePath, string itemId);
+
+    /// <summary>
+    /// Frees the local disk space a hydrated file occupies, leaving it visible and
+    /// online-only. Returns false if the file couldn't be dehydrated (not a placeholder,
+    /// in use, or already online-only).
+    /// </summary>
+    bool TryFreeSpace(string poolId, string localFilePath);
 }
