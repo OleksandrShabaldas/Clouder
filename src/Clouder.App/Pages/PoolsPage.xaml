@@ -121,10 +121,11 @@
                                         <TextBlock Text="Manage" FontSize="12" />
                                     </StackPanel>
                                 </Button>
-                                <Button Tag="{Binding PoolId}" Click="EditPriorities_Click" ToolTipService.ToolTip="Set drive priorities">
+                                <Button Tag="{Binding PoolId}" Click="EditPriorities_Click"
+                                        ToolTipService.ToolTip="Fill order, usage caps and reserved space per account">
                                     <StackPanel Orientation="Horizontal" Spacing="6">
                                         <FontIcon Glyph="&#xE8CB;" FontSize="12" />
-                                        <TextBlock Text="Priorities" FontSize="12" />
+                                        <TextBlock Text="Accounts" FontSize="12" />
                                     </StackPanel>
                                 </Button>
                                 <Button Tag="{Binding PoolId}" Click="EditPool_Click" ToolTipService.ToolTip="Edit pool settings">

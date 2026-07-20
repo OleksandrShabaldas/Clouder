@@ -29,10 +29,16 @@ public class StoragePoolManagerTests : IAsyncDisposable
         return new StoragePoolManager(_store, registry);
     }
 
+    /// <summary>
+    /// Both members share fill tier 0 by default, so the placement strategy is what
+    /// decides between them. Pass distinct priorities to test tier fallthrough.
+    /// </summary>
     private async Task<(StoragePool Pool, Dictionary<string, StorageQuota> Quotas)> SetupTwoMemberPoolAsync(
         long member1Total, long member1Used,
         long member2Total, long member2Used,
-        PlacementStrategy strategy = PlacementStrategy.FillFirst)
+        PlacementStrategy strategy = PlacementStrategy.FillFirst,
+        int member1Priority = 0,
+        int member2Priority = 0)
     {
         await _store.InitializeAsync();
 
@@ -56,8 +62,8 @@ public class StoragePoolManagerTests : IAsyncDisposable
             DefaultStrategy = strategy,
             Members =
             [
-                new PoolMember { AccountId = "acc-gd", ProviderId = "google-drive", Priority = 1, IsEnabled = true },
-                new PoolMember { AccountId = "acc-mega", ProviderId = "mega", Priority = 2, IsEnabled = true }
+                new PoolMember { AccountId = "acc-gd", ProviderId = "google-drive", Priority = member1Priority, IsEnabled = true },
+                new PoolMember { AccountId = "acc-mega", ProviderId = "mega", Priority = member2Priority, IsEnabled = true }
             ]
         };
         await _store.UpsertPoolAsync(pool);
@@ -74,17 +80,52 @@ public class StoragePoolManagerTests : IAsyncDisposable
     // ── Direct placement ────────────────────────────────────────────────
 
     [Fact]
-    public async Task DirectPlace_FillFirst_PicksHighestPriority()
+    public async Task DirectPlace_FillsLowerTierFirst()
     {
         var (pool, quotas) = await SetupTwoMemberPoolAsync(
-            member1Total: GB(15), member1Used: GB(5),   // GD: 10GB free, priority 1
-            member2Total: GB(20), member2Used: GB(5),   // MEGA: 15GB free, priority 2
-            strategy: PlacementStrategy.FillFirst);
+            member1Total: GB(15), member1Used: GB(5),   // GD: 10GB free, tier 0
+            member2Total: GB(20), member2Used: GB(5),   // MEGA: 15GB free, tier 1
+            strategy: PlacementStrategy.FillFirst,
+            member1Priority: 0, member2Priority: 1);
 
         var manager = CreateManager(quotas);
         var decision = await manager.DecidePlacementAsync("pool-1", "photo.jpg", GB(1));
 
         Assert.Equal(PlacementOutcome.DirectPlace, decision.Outcome);
+        Assert.Equal("acc-gd", decision.TargetAccountId);
+    }
+
+    [Fact]
+    public async Task HigherTierIsUsedOnlyWhenTheLowerTierCannotFit()
+    {
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(14),  // GD: 1GB free, tier 0
+            member2Total: GB(20), member2Used: GB(5),   // MEGA: 15GB free, tier 1
+            strategy: PlacementStrategy.FillFirst,
+            member1Priority: 0, member2Priority: 1);
+
+        var manager = CreateManager(quotas);
+        var decision = await manager.DecidePlacementAsync("pool-1", "movie.mkv", GB(5));
+
+        // Tier 0 can't take 5GB, so placement falls through to tier 1.
+        Assert.Equal(PlacementOutcome.DirectPlace, decision.Outcome);
+        Assert.Equal("acc-mega", decision.TargetAccountId);
+    }
+
+    [Fact]
+    public async Task StrategyDecidesWithinATier_NotAcrossTiers()
+    {
+        // MEGA has far more free space, but it's in a higher tier — the strategy
+        // must not reach past tier 0 to get it.
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(5),   // GD: 10GB free, tier 0
+            member2Total: GB(100), member2Used: GB(1),  // MEGA: 99GB free, tier 1
+            strategy: PlacementStrategy.LargestFree,
+            member1Priority: 0, member2Priority: 1);
+
+        var manager = CreateManager(quotas);
+        var decision = await manager.DecidePlacementAsync("pool-1", "doc.pdf", GB(1));
+
         Assert.Equal("acc-gd", decision.TargetAccountId);
     }
 
@@ -233,22 +274,137 @@ public class StoragePoolManagerTests : IAsyncDisposable
     [Fact]
     public async Task Reorg_PlanDirectly_FreesRequestedSpace()
     {
+        // Neither member can take 6GB as-is, so a reorg is genuinely needed:
+        // moving GD's 3GB file to MEGA gets GD to 6GB free.
         var (pool, quotas) = await SetupTwoMemberPoolAsync(
-            member1Total: GB(10), member1Used: GB(9),   // 1GB free
-            member2Total: GB(10), member2Used: GB(3));   // 7GB free
+            member1Total: GB(10), member1Used: GB(7),   // GD: 3GB free
+            member2Total: GB(10), member2Used: GB(6));   // MEGA: 4GB free
 
         await _store.UpsertItemAsync(new CloudItem
         {
             Id = "movable", RemoteId = "rm", ProviderId = "google-drive", AccountId = "acc-gd",
-            Name = "movable.dat", Type = CloudItemType.File, Size = GB(4),
+            Name = "movable.dat", Type = CloudItemType.File, Size = GB(3),
             CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
         });
 
         var manager = CreateManager(quotas);
-        var plan = await manager.PlanReorganizationAsync("pool-1", GB(5));
+        var plan = await manager.PlanReorganizationAsync("pool-1", GB(6));
 
         Assert.True(plan.Moves.Count > 0);
-        Assert.True(plan.FreedBytes >= GB(4));
+        Assert.True(plan.FreedBytes >= GB(3));
+    }
+
+    [Fact]
+    public async Task Reorg_NotNeededWhenAMemberAlreadyHasRoom()
+    {
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(10), member1Used: GB(9),   // 1GB free
+            member2Total: GB(10), member2Used: GB(3));   // 7GB free — already fits
+
+        var manager = CreateManager(quotas);
+        var plan = await manager.PlanReorganizationAsync("pool-1", GB(5));
+
+        Assert.Empty(plan.Moves);
+    }
+
+    // ── Per-member limits ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task ReserveKeepsSpaceFreeOnTheAccount()
+    {
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(10),  // 5GB free
+            member2Total: GB(15), member2Used: GB(10),  // 5GB free
+            strategy: PlacementStrategy.LargestFree);
+
+        // Keep 4GB free on GD for things that aren't the pool's business.
+        pool.Members.First(m => m.AccountId == "acc-gd").ReserveBytes = GB(4);
+        await _store.UpsertPoolAsync(pool);
+
+        var manager = CreateManager(quotas);
+
+        // 3GB won't fit in GD's remaining 1GB allowance, so it goes to MEGA.
+        var decision = await manager.DecidePlacementAsync("pool-1", "big.bin", GB(3));
+        Assert.Equal("acc-mega", decision.TargetAccountId);
+    }
+
+    [Fact]
+    public async Task MaxUsageCapsWhatThePoolStoresOnAnAccount()
+    {
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(1),   // plenty of raw space
+            member2Total: GB(15), member2Used: GB(10),
+            strategy: PlacementStrategy.LargestFree);
+
+        // This pool may only ever use 5GB of GD, and 4GB of that is already spent.
+        pool.Members.First(m => m.AccountId == "acc-gd").MaxUsageBytes = GB(5);
+        await _store.UpsertPoolAsync(pool);
+
+        await _store.UpsertItemAsync(new CloudItem
+        {
+            Id = "pool-1|existing.dat", RemoteId = "r1", ProviderId = "google-drive", AccountId = "acc-gd",
+            Name = "existing.dat", Type = CloudItemType.File, Size = GB(4),
+            CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
+        });
+
+        var manager = CreateManager(quotas);
+
+        // Only 1GB of allowance left on GD despite 14GB actually being free there.
+        var decision = await manager.DecidePlacementAsync("pool-1", "big.bin", GB(3));
+        Assert.Equal("acc-mega", decision.TargetAccountId);
+    }
+
+    [Fact]
+    public async Task RemainingAllowanceIsStillUsable()
+    {
+        // FillFirst packs the fullest member that still fits, so the capped account
+        // is chosen — proving the leftover allowance is spendable, not written off.
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(1),
+            member2Total: GB(15), member2Used: GB(5),
+            strategy: PlacementStrategy.FillFirst);
+
+        pool.Members.First(m => m.AccountId == "acc-gd").MaxUsageBytes = GB(5);
+        await _store.UpsertPoolAsync(pool);
+
+        await _store.UpsertItemAsync(new CloudItem
+        {
+            Id = "pool-1|existing.dat", RemoteId = "r1", ProviderId = "google-drive", AccountId = "acc-gd",
+            Name = "existing.dat", Type = CloudItemType.File, Size = GB(4),
+            CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
+        });
+
+        var manager = CreateManager(quotas);
+
+        // GD: 1GB of allowance left. MEGA: 10GB free. FillFirst takes the tighter fit.
+        var decision = await manager.DecidePlacementAsync("pool-1", "small.bin", GB(1));
+        Assert.Equal("acc-gd", decision.TargetAccountId);
+    }
+
+    [Fact]
+    public async Task UsageCapCountsOnlyThisPoolsFiles()
+    {
+        var (pool, quotas) = await SetupTwoMemberPoolAsync(
+            member1Total: GB(15), member1Used: GB(1),
+            member2Total: GB(15), member2Used: GB(14),
+            strategy: PlacementStrategy.LargestFree);
+
+        pool.Members.First(m => m.AccountId == "acc-gd").MaxUsageBytes = GB(5);
+        await _store.UpsertPoolAsync(pool);
+
+        // A file belonging to a DIFFERENT pool on the same account must not count
+        // against this pool's allowance.
+        await _store.UpsertItemAsync(new CloudItem
+        {
+            Id = "other-pool|huge.dat", RemoteId = "r9", ProviderId = "google-drive", AccountId = "acc-gd",
+            Name = "huge.dat", Type = CloudItemType.File, Size = GB(4),
+            CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
+        });
+
+        var manager = CreateManager(quotas);
+        var decision = await manager.DecidePlacementAsync("pool-1", "file.bin", GB(4));
+
+        Assert.Equal("acc-gd", decision.TargetAccountId);
     }
 
     // ── Pool status ─────────────────────────────────────────────────────

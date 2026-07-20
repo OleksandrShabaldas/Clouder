@@ -16,6 +16,8 @@ public interface IMetadataStore : IAsyncDisposable
     Task<IReadOnlyList<CloudItem>> GetItemsByIdPrefixAsync(string idPrefix, CancellationToken ct = default);
     /// <summary>Finds a tracked item by its remote id on a given account — used to apply remote changes.</summary>
     Task<CloudItem?> GetItemByRemoteIdAsync(string accountId, string remoteId, CancellationToken ct = default);
+    /// <summary>Total bytes this pool currently stores on one account (for per-member usage caps).</summary>
+    Task<long> GetPoolUsageOnAccountAsync(string poolId, string accountId, CancellationToken ct = default);
 
     // Accounts
     Task<ProviderAccount?> GetAccountAsync(string accountId, CancellationToken ct = default);

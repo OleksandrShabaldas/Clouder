@@ -26,7 +26,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
         string poolId, string fileName, long fileSize,
         string? folderPath = null, CancellationToken ct = default)
     {
-        var (pool, members, quotas) = await LoadPoolStateAsync(poolId, ct);
+        var (pool, members, quotas, effectiveFree) = await LoadPoolStateAsync(poolId, ct);
 
         if (members.Count == 0)
             return new PlacementDecision { Outcome = PlacementOutcome.InsufficientSpace };
@@ -43,8 +43,8 @@ public sealed class StoragePoolManager : IStoragePoolManager
                     return new PlacementDecision { Outcome = PlacementOutcome.Excluded };
 
                 case FileRuleAction.RouteToAccount when matchedRule.TargetAccountId != null:
-                    if (quotas.TryGetValue(matchedRule.TargetAccountId, out var targetQuota)
-                        && targetQuota.FreeBytes >= fileSize)
+                    if (effectiveFree.TryGetValue(matchedRule.TargetAccountId, out var targetFree)
+                        && targetFree >= fileSize)
                         return new PlacementDecision
                         {
                             Outcome = PlacementOutcome.DirectPlace,
@@ -55,8 +55,8 @@ public sealed class StoragePoolManager : IStoragePoolManager
                 case FileRuleAction.RouteToProvider when matchedRule.TargetProviderId != null:
                     var providerTarget = members
                         .Where(m => m.ProviderId == matchedRule.TargetProviderId
-                                    && quotas[m.AccountId].FreeBytes >= fileSize)
-                        .OrderByDescending(m => quotas[m.AccountId].FreeBytes)
+                                    && effectiveFree[m.AccountId] >= fileSize)
+                        .OrderByDescending(m => effectiveFree[m.AccountId])
                         .FirstOrDefault();
                     if (providerTarget != null)
                         return new PlacementDecision
@@ -67,7 +67,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
                     break; // No provider account with space — fall through
 
                 case FileRuleAction.UseStrategy when matchedRule.OverrideStrategy.HasValue:
-                    var overrideTarget = SelectTarget(matchedRule.OverrideStrategy.Value, members, quotas, fileSize);
+                    var overrideTarget = SelectTarget(matchedRule.OverrideStrategy.Value, members, effectiveFree, quotas, fileSize);
                     if (overrideTarget != null)
                         return new PlacementDecision
                         {
@@ -79,11 +79,11 @@ public sealed class StoragePoolManager : IStoragePoolManager
         }
 
         // ── Default placement logic ─────────────────────────────────
-        var targetAccountId = SelectTarget(pool.DefaultStrategy, members, quotas, fileSize);
+        var targetAccountId = SelectTarget(pool.DefaultStrategy, members, effectiveFree, quotas, fileSize);
         if (targetAccountId != null)
             return new PlacementDecision { Outcome = PlacementOutcome.DirectPlace, TargetAccountId = targetAccountId };
 
-        long totalFree = quotas.Values.Sum(q => q.FreeBytes);
+        long totalFree = effectiveFree.Values.Sum();
         if (totalFree < fileSize)
             return new PlacementDecision { Outcome = PlacementOutcome.InsufficientSpace };
 
@@ -93,26 +93,26 @@ public sealed class StoragePoolManager : IStoragePoolManager
             return new PlacementDecision
             {
                 Outcome = PlacementOutcome.StripingRequired,
-                StripePlans = BuildStripePlan(members, quotas, fileSize)
+                StripePlans = BuildStripePlan(members, effectiveFree, fileSize)
             };
         }
 
-        var reorgPlan = await BuildReorgPlanAsync(pool, members, quotas, fileSize, ct);
+        var reorgPlan = await BuildReorgPlanAsync(pool, members, effectiveFree, fileSize, ct);
         if (reorgPlan.Moves.Count > 0)
             return new PlacementDecision { Outcome = PlacementOutcome.ReorgRequired, ReorgPlan = reorgPlan };
 
         return new PlacementDecision
         {
             Outcome = PlacementOutcome.StripingRequired,
-            StripePlans = BuildStripePlan(members, quotas, fileSize)
+            StripePlans = BuildStripePlan(members, effectiveFree, fileSize)
         };
     }
 
     public async Task<ReorganizationPlan> PlanReorganizationAsync(
         string poolId, long requiredFreeBytes, CancellationToken ct = default)
     {
-        var (pool, members, quotas) = await LoadPoolStateAsync(poolId, ct);
-        return await BuildReorgPlanAsync(pool, members, quotas, requiredFreeBytes, ct);
+        var (pool, members, quotas, effectiveFree) = await LoadPoolStateAsync(poolId, ct);
+        return await BuildReorgPlanAsync(pool, members, effectiveFree, requiredFreeBytes, ct);
     }
 
     public async Task ExecuteReorganizationAsync(
@@ -209,14 +209,14 @@ public sealed class StoragePoolManager : IStoragePoolManager
     public async Task<List<StripePlan>> BuildStripePlanForAsync(
         string poolId, long fileSize, CancellationToken ct = default)
     {
-        var (_, members, quotas) = await LoadPoolStateAsync(poolId, ct);
+        var (_, members, quotas, effectiveFree) = await LoadPoolStateAsync(poolId, ct);
         if (members.Count == 0) return [];
-        return BuildStripePlan(members, quotas, fileSize);
+        return BuildStripePlan(members, effectiveFree, fileSize);
     }
 
     public async Task<PoolStatus> GetPoolStatusAsync(string poolId, CancellationToken ct = default)
     {
-        var (pool, members, quotas) = await LoadPoolStateAsync(poolId, ct);
+        var (pool, members, quotas, effectiveFree) = await LoadPoolStateAsync(poolId, ct);
 
         var memberStatuses = members.Select(m =>
         {
@@ -242,33 +242,60 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
     // ── Placement strategies ────────────────────────────────────────────
 
-    private string? SelectTarget(
+    /// <summary>
+    /// Chooses where a file goes, honouring fill tiers.
+    ///
+    /// Members are grouped by <see cref="PoolMember.Priority"/>: the lowest tier that
+    /// can take the file wins, and the strategy only decides *which* member within
+    /// that tier. So tier 0 = {A, B, C} and tier 1 = {D} spreads files across A/B/C
+    /// by the strategy and doesn't touch D until all three are full.
+    /// </summary>
+    private static string? SelectTarget(
         PlacementStrategy strategy,
         List<PoolMember> members,
+        Dictionary<string, long> effectiveFree,
         Dictionary<string, StorageQuota> quotas,
         long fileSize)
     {
-        var eligible = members.Where(m => quotas[m.AccountId].FreeBytes >= fileSize).ToList();
-        if (eligible.Count == 0)
-            return null;
+        var tiers = members
+            .GroupBy(m => m.Priority)
+            .OrderBy(g => g.Key);
 
-        return strategy switch
+        foreach (var tier in tiers)
         {
+            var eligible = tier.Where(m => effectiveFree[m.AccountId] >= fileSize).ToList();
+            if (eligible.Count == 0) continue; // tier exhausted — fall to the next one
+
+            return SelectWithinTier(strategy, eligible, effectiveFree, quotas);
+        }
+
+        return null;
+    }
+
+    private static string SelectWithinTier(
+        PlacementStrategy strategy,
+        List<PoolMember> eligible,
+        Dictionary<string, long> effectiveFree,
+        Dictionary<string, StorageQuota> quotas) =>
+        strategy switch
+        {
+            // Pack one member at a time: the fullest that still fits goes first, so
+            // space is consolidated rather than smeared across the tier.
             PlacementStrategy.FillFirst => eligible
-                .OrderBy(m => m.Priority)
+                .OrderBy(m => effectiveFree[m.AccountId])
+                .ThenBy(m => m.AccountId, StringComparer.Ordinal)
                 .First().AccountId,
 
             PlacementStrategy.LargestFree => eligible
-                .OrderByDescending(m => quotas[m.AccountId].FreeBytes)
+                .OrderByDescending(m => effectiveFree[m.AccountId])
+                .ThenBy(m => m.AccountId, StringComparer.Ordinal)
                 .First().AccountId,
 
             PlacementStrategy.RoundRobin => SelectRoundRobin(eligible, quotas),
 
-            _ => eligible
-                .OrderBy(m => m.Priority)
-                .First().AccountId,
+            // Custom: rules already had their say; spread evenly as the fallback.
+            _ => SelectRoundRobin(eligible, quotas)
         };
-    }
 
     private static string SelectRoundRobin(List<PoolMember> eligible, Dictionary<string, StorageQuota> quotas)
     {
@@ -279,6 +306,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
                 var q = quotas[m.AccountId];
                 return q.TotalBytes == 0 ? 1.0 : (double)q.UsedBytes / q.TotalBytes;
             })
+            .ThenBy(m => m.AccountId, StringComparer.Ordinal)
             .First().AccountId;
     }
 
@@ -287,7 +315,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
     private async Task<ReorganizationPlan> BuildReorgPlanAsync(
         StoragePool pool,
         List<PoolMember> members,
-        Dictionary<string, StorageQuota> quotas,
+        Dictionary<string, long> effectiveFree,
         long requiredFreeBytes,
         CancellationToken ct)
     {
@@ -295,13 +323,11 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
         // Try each member as a potential target, largest capacity first
         var candidates = members
-            .Where(m => quotas[m.AccountId].TotalBytes >= requiredFreeBytes)
-            .OrderByDescending(m => quotas[m.AccountId].TotalBytes);
+            .OrderByDescending(m => effectiveFree[m.AccountId]);
 
         foreach (var target in candidates)
         {
-            var targetQuota = quotas[target.AccountId];
-            long needToFree = requiredFreeBytes - targetQuota.FreeBytes;
+            long needToFree = requiredFreeBytes - effectiveFree[target.AccountId];
 
             if (needToFree <= 0)
             {
@@ -316,7 +342,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
             // Clone available free space for other members to track during planning
             var availableFree = members
                 .Where(m => m.AccountId != target.AccountId)
-                .ToDictionary(m => m.AccountId, m => quotas[m.AccountId].FreeBytes);
+                .ToDictionary(m => m.AccountId, m => effectiveFree[m.AccountId]);
 
             var itemsOnTarget = await _store.GetItemsByAccountAsync(target.AccountId, ct);
             var movableFiles = itemsOnTarget
@@ -364,7 +390,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
     private static List<StripePlan> BuildStripePlan(
         List<PoolMember> members,
-        Dictionary<string, StorageQuota> quotas,
+        Dictionary<string, long> effectiveFree,
         long fileSize)
     {
         var plans = new List<StripePlan>();
@@ -373,14 +399,14 @@ public sealed class StoragePoolManager : IStoragePoolManager
         int chunkIndex = 0;
 
         var sorted = members
-            .OrderByDescending(m => quotas[m.AccountId].FreeBytes);
+            .OrderByDescending(m => effectiveFree[m.AccountId]);
 
         foreach (var member in sorted)
         {
             if (remaining <= 0)
                 break;
 
-            long chunkSize = Math.Min(quotas[member.AccountId].FreeBytes, remaining);
+            long chunkSize = Math.Min(effectiveFree[member.AccountId], remaining);
             if (chunkSize <= 0)
                 continue;
 
@@ -401,7 +427,26 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    private async Task<(StoragePool Pool, List<PoolMember> Members, Dictionary<string, StorageQuota> Quotas)>
+    /// <summary>
+    /// How much of an account this pool may still use: whatever the account has free,
+    /// less the member's reserve, and never more than its remaining usage allowance.
+    /// </summary>
+    private async Task<long> ComputeEffectiveFreeAsync(
+        string poolId, PoolMember member, StorageQuota quota, CancellationToken ct)
+    {
+        long free = quota.FreeBytes - member.ReserveBytes;
+
+        if (member.MaxUsageBytes > 0)
+        {
+            long alreadyUsed = await _store.GetPoolUsageOnAccountAsync(poolId, member.AccountId, ct);
+            free = Math.Min(free, member.MaxUsageBytes - alreadyUsed);
+        }
+
+        return Math.Max(0, free);
+    }
+
+    private async Task<(StoragePool Pool, List<PoolMember> Members,
+                        Dictionary<string, StorageQuota> Quotas, Dictionary<string, long> EffectiveFree)>
         LoadPoolStateAsync(string poolId, CancellationToken ct)
     {
         var pool = await _store.GetPoolAsync(poolId, ct)
@@ -410,6 +455,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
         var enabled = pool.Members.Where(m => m.IsEnabled).ToList();
         var members = new List<PoolMember>();
         var quotas = new Dictionary<string, StorageQuota>();
+        var effectiveFree = new Dictionary<string, long>();
 
         // Only include members whose provider is connected and reachable.
         // A disconnected account is skipped rather than aborting the whole operation.
@@ -425,7 +471,9 @@ public sealed class StoragePoolManager : IStoragePoolManager
 
             try
             {
-                quotas[member.AccountId] = await Quotas.GetAsync(provider, member.AccountId, ct);
+                var quota = await Quotas.GetAsync(provider, member.AccountId, ct);
+                quotas[member.AccountId] = quota;
+                effectiveFree[member.AccountId] = await ComputeEffectiveFreeAsync(poolId, member, quota, ct);
                 members.Add(member);
             }
             catch (Exception ex)
@@ -435,7 +483,7 @@ public sealed class StoragePoolManager : IStoragePoolManager
             }
         }
 
-        return (pool, members, quotas);
+        return (pool, members, quotas, effectiveFree);
     }
 
     private Task<string> ResolveDestinationFolderAsync(

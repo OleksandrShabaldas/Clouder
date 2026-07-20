@@ -10,23 +10,24 @@ public sealed partial class PoolsPage : Page
 {
     private static readonly Dictionary<PlacementStrategy, string> StrategyDescriptions = new()
     {
+        // These describe how a file is placed WITHIN a fill tier. Tiers themselves are
+        // always consumed lowest-first — see the Accounts dialog.
         [PlacementStrategy.FillFirst] =
-            "Fills each account in priority order before moving to the next. "
-            + "Best when you want to maximize usage of your primary account first "
-            + "and keep others as overflow.",
+            "Packs one account at a time: within a tier, the account with the least free "
+            + "space that still fits gets the file. Keeps free space consolidated instead "
+            + "of leaving gaps everywhere.",
 
         [PlacementStrategy.RoundRobin] =
-            "Distributes files evenly across all member accounts by usage percentage. "
-            + "Best for balanced wear and keeping all accounts at similar fill levels.",
+            "Keeps accounts in a tier at similar fill levels by always choosing the one "
+            + "with the lowest usage percentage. Best for spreading wear evenly.",
 
         [PlacementStrategy.LargestFree] =
-            "Always places new files on the account with the most free space. "
-            + "Best for maximizing headroom and avoiding any single account from filling up.",
+            "Places each file on whichever account in the tier has the most free space. "
+            + "Best for keeping maximum headroom on every account.",
 
         [PlacementStrategy.Custom] =
-            "Uses your file rules to decide placement. Files that don't match any rule "
-            + "fall back to FillFirst. Best when you want fine-grained control "
-            + "(e.g. videos on one account, documents on another)."
+            "Your file rules decide placement (e.g. videos to one account, documents to "
+            + "another). Anything no rule matches is spread evenly within its tier."
     };
 
     public PoolsPage()
@@ -746,60 +747,120 @@ public sealed partial class PoolsPage : Page
         var accounts = await App.Store.GetAllAccountsAsync();
         var accountMap = accounts.ToDictionary(a => a.AccountId);
 
-        var priorityPanel = new StackPanel { Spacing = 8 };
+        var panel = new StackPanel { Spacing = 10 };
 
-        var infoBar = new InfoBar
+        panel.Children.Add(new InfoBar
         {
-            Title = "Drive Priorities",
-            Message = "Lower number = higher priority. For FillFirst strategy, drives are filled in priority order. "
-                    + "For other strategies, priority is used as a tiebreaker.",
+            Title = "Fill order",
+            Message = "Accounts are filled tier by tier, lowest number first. Accounts sharing a tier "
+                    + "are used together, with the pool's placement strategy choosing between them — "
+                    + "so tier 0 on three accounts spreads files across all three, and tier 1 is only "
+                    + "touched once those three are full.",
             Severity = InfoBarSeverity.Informational,
             IsOpen = true,
             IsClosable = false
-        };
-        priorityPanel.Children.Add(infoBar);
+        });
 
-        var memberControls = new List<(string AccountId, NumberBox PriorityBox, ToggleSwitch EnableSwitch)>();
-
-        foreach (var member in pool.Members.OrderBy(m => m.Priority))
+        panel.Children.Add(new InfoBar
         {
-            var accName = accountMap.TryGetValue(member.AccountId, out var acc)
-                ? acc.DisplayName : member.AccountId;
+            Title = "Limits are optional",
+            Message = "Set a usage cap to stop this pool growing past a certain size on an account, "
+                    + "or a reserve to always leave space free — useful when you also keep unrelated "
+                    + "files in that cloud storage. 0 means no limit.",
+            Severity = InfoBarSeverity.Informational,
+            IsOpen = true,
+            IsClosable = false
+        });
 
-            var priorityBox = new NumberBox
+        var controls = new List<(string AccountId, NumberBox Tier, ToggleSwitch Enabled, NumberBox Cap, NumberBox Reserve)>();
+
+        foreach (var member in pool.Members.OrderBy(m => m.Priority).ThenBy(m => m.AccountId, StringComparer.Ordinal))
+        {
+            var account = accountMap.GetValueOrDefault(member.AccountId);
+            var accName = account?.DisplayName ?? member.AccountId;
+            var quotaText = account?.Quota is { TotalBytes: > 0 } q
+                ? $"{FormatBytes(q.UsedBytes)} of {FormatBytes(q.TotalBytes)} used"
+                : "no quota data";
+
+            var tierBox = new NumberBox
             {
-                Header = accName,
+                Header = "Fill tier",
                 Value = member.Priority,
                 Minimum = 0,
                 Maximum = 99,
-                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
-                HorizontalAlignment = HorizontalAlignment.Stretch
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
             };
 
-            var enableSwitch = new ToggleSwitch
+            var enabledSwitch = new ToggleSwitch
             {
-                Header = "Enabled",
-                IsOn = member.IsEnabled,
-                Margin = new Thickness(0, 4, 0, 0)
+                Header = "Use this account",
+                IsOn = member.IsEnabled
             };
 
-            var memberCard = new Border
+            var capBox = new NumberBox
+            {
+                Header = "Usage cap (GB, 0 = no limit)",
+                Value = BytesToGb(member.MaxUsageBytes),
+                Minimum = 0,
+                Maximum = 100000,
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+            };
+
+            var reserveBox = new NumberBox
+            {
+                Header = "Keep free (GB, 0 = none)",
+                Value = BytesToGb(member.ReserveBytes),
+                Minimum = 0,
+                Maximum = 100000,
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+            };
+
+            var limitsGrid = new Grid { ColumnSpacing = 12 };
+            limitsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            limitsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(capBox, 0);
+            Grid.SetColumn(reserveBox, 1);
+            limitsGrid.Children.Add(capBox);
+            limitsGrid.Children.Add(reserveBox);
+
+            var header = new StackPanel { Spacing = 1 };
+            header.Children.Add(new TextBlock { Text = accName, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+            header.Children.Add(new TextBlock
+            {
+                Text = quotaText,
+                FontSize = 12,
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+            });
+
+            var topRow = new Grid { ColumnSpacing = 12 };
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            Grid.SetColumn(header, 0);
+            Grid.SetColumn(tierBox, 1);
+            topRow.Children.Add(header);
+            topRow.Children.Add(tierBox);
+
+            var card = new Border
             {
                 Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
                 CornerRadius = new CornerRadius(6),
                 Padding = new Thickness(12),
-                Child = new StackPanel { Spacing = 8, Children = { priorityBox, enableSwitch } }
+                Child = new StackPanel
+                {
+                    Spacing = 10,
+                    Children = { topRow, limitsGrid, enabledSwitch }
+                }
             };
 
-            priorityPanel.Children.Add(memberCard);
-            memberControls.Add((member.AccountId, priorityBox, enableSwitch));
+            panel.Children.Add(card);
+            controls.Add((member.AccountId, tierBox, enabledSwitch, capBox, reserveBox));
         }
 
         var dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
-            Title = $"Priorities: {pool.Name}",
-            Content = new ScrollViewer { Content = priorityPanel, MaxHeight = 450 },
+            Title = $"Accounts in {pool.Name}",
+            Content = new ScrollViewer { Content = panel, MaxHeight = 520 },
             PrimaryButtonText = "Save",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary
@@ -807,17 +868,32 @@ public sealed partial class PoolsPage : Page
 
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
-        foreach (var (accountId, priorityBox, enableSwitch) in memberControls)
+        foreach (var (accountId, tier, enabled, cap, reserve) in controls)
         {
             var member = pool.Members.First(m => m.AccountId == accountId);
-            member.Priority = (int)priorityBox.Value;
-            member.IsEnabled = enableSwitch.IsOn;
+            member.Priority = (int)tier.Value;
+            member.IsEnabled = enabled.IsOn;
+            member.MaxUsageBytes = GbToBytes(cap.Value);
+            member.ReserveBytes = GbToBytes(reserve.Value);
+        }
+
+        if (!pool.Members.Any(m => m.IsEnabled))
+        {
+            await ShowErrorAsync("At least one account is required",
+                "A pool needs one enabled account to store anything. Nothing was changed.");
+            return;
         }
 
         await App.Store.UpsertPoolAsync(pool);
-        ClouderLog.Info($"Updated priorities for pool '{pool.Name}'");
+        ClouderLog.Info($"Updated member settings for pool '{pool.Name}'");
         await RefreshPoolsAsync();
     }
+
+    private static double BytesToGb(long bytes) =>
+        bytes <= 0 ? 0 : Math.Round(bytes / (1024.0 * 1024 * 1024), 2);
+
+    private static long GbToBytes(double gb) =>
+        double.IsNaN(gb) || gb <= 0 ? 0 : (long)(gb * 1024 * 1024 * 1024);
 
     // ── Merge Pools ─────────────────────────────────────────────────────
 

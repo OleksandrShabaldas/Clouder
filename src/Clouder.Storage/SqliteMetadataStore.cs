@@ -170,6 +170,13 @@ public sealed class SqliteMetadataStore : IMetadataStore
         }
         catch (SqliteException) { /* column already exists */ }
 
+        try
+        {
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE pool_members ADD COLUMN max_usage_bytes INTEGER NOT NULL DEFAULT 0", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE pool_members ADD COLUMN reserve_bytes INTEGER NOT NULL DEFAULT 0", ct);
+        }
+        catch (SqliteException) { /* columns already exist */ }
+
         await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS conflicts (
                 conflict_id TEXT PRIMARY KEY,
@@ -327,6 +334,23 @@ public sealed class SqliteMetadataStore : IMetadataStore
         return results;
     }
 
+    public async Task<long> GetPoolUsageOnAccountAsync(string poolId, string accountId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        // Only this pool's files on this account — the account may hold plenty else.
+        cmd.CommandText = """
+            SELECT COALESCE(SUM(size), 0) FROM items
+            WHERE account_id = @accountId AND substr(id, 1, @len) = @prefix
+            """;
+        var prefix = poolId + "|";
+        cmd.Parameters.AddWithValue("@accountId", accountId);
+        cmd.Parameters.AddWithValue("@len", prefix.Length);
+        cmd.Parameters.AddWithValue("@prefix", prefix);
+
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
+    }
+
     public async Task<CloudItem?> GetItemByRemoteIdAsync(string accountId, string remoteId, CancellationToken ct = default)
     {
         await using var conn = await OpenConnectionAsync(ct);
@@ -475,8 +499,10 @@ public sealed class SqliteMetadataStore : IMetadataStore
             await using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = """
-                INSERT INTO pool_members (pool_id, account_id, provider_id, priority, is_enabled, root_folder_id)
-                VALUES (@poolId, @accountId, @providerId, @priority, @enabled, @rootFolder)
+                INSERT INTO pool_members (pool_id, account_id, provider_id, priority, is_enabled, root_folder_id,
+                                          max_usage_bytes, reserve_bytes)
+                VALUES (@poolId, @accountId, @providerId, @priority, @enabled, @rootFolder,
+                        @maxUsage, @reserve)
                 """;
             cmd.Parameters.AddWithValue("@poolId", pool.PoolId);
             cmd.Parameters.AddWithValue("@accountId", member.AccountId);
@@ -484,6 +510,8 @@ public sealed class SqliteMetadataStore : IMetadataStore
             cmd.Parameters.AddWithValue("@priority", member.Priority);
             cmd.Parameters.AddWithValue("@enabled", member.IsEnabled ? 1 : 0);
             cmd.Parameters.AddWithValue("@rootFolder", (object?)member.RootFolderId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@maxUsage", member.MaxUsageBytes);
+            cmd.Parameters.AddWithValue("@reserve", member.ReserveBytes);
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
@@ -1075,7 +1103,9 @@ public sealed class SqliteMetadataStore : IMetadataStore
                 IsEnabled = reader.GetInt32(reader.GetOrdinal("is_enabled")) == 1,
                 RootFolderId = reader.IsDBNull(reader.GetOrdinal("root_folder_id"))
                     ? null
-                    : reader.GetString(reader.GetOrdinal("root_folder_id"))
+                    : reader.GetString(reader.GetOrdinal("root_folder_id")),
+                MaxUsageBytes = ReadLongOrZero(reader, "max_usage_bytes"),
+                ReserveBytes = ReadLongOrZero(reader, "reserve_bytes")
             });
         }
         return members;
@@ -1100,6 +1130,17 @@ public sealed class SqliteMetadataStore : IMetadataStore
         ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc"))),
         SyncState = ReadSyncState(reader)
     };
+
+    /// <summary>Reads a column that may not exist yet in an older database file.</summary>
+    private static long ReadLongOrZero(SqliteDataReader reader, string column)
+    {
+        try
+        {
+            var ord = reader.GetOrdinal(column);
+            return reader.IsDBNull(ord) ? 0 : reader.GetInt64(ord);
+        }
+        catch { return 0; }
+    }
 
     private static SyncState ReadSyncState(SqliteDataReader reader)
     {
