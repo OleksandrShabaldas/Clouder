@@ -164,6 +164,30 @@ public sealed class SqliteMetadataStore : IMetadataStore
         }
         catch (SqliteException) { /* column already exists */ }
 
+        try
+        {
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE items ADD COLUMN sync_state INTEGER NOT NULL DEFAULT 0", ct);
+        }
+        catch (SqliteException) { /* column already exists */ }
+
+        await ExecuteNonQueryAsync(conn, """
+            CREATE TABLE IF NOT EXISTS conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                pool_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                local_modified_utc TEXT NOT NULL,
+                remote_modified_utc TEXT NOT NULL,
+                local_size INTEGER NOT NULL DEFAULT 0,
+                remote_size INTEGER NOT NULL DEFAULT 0,
+                detected_at_utc TEXT NOT NULL
+            )
+            """, ct);
+
+        await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_conflicts_pool ON conflicts(pool_id)", ct);
+
         await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS email_configs (
                 config_id TEXT PRIMARY KEY,
@@ -214,8 +238,8 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await using var conn = await OpenConnectionAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO items (id, remote_id, provider_id, account_id, name, parent_id, type, size, content_hash, created_at_utc, modified_at_utc)
-            VALUES (@id, @remoteId, @providerId, @accountId, @name, @parentId, @type, @size, @hash, @created, @modified)
+            INSERT INTO items (id, remote_id, provider_id, account_id, name, parent_id, type, size, content_hash, created_at_utc, modified_at_utc, sync_state)
+            VALUES (@id, @remoteId, @providerId, @accountId, @name, @parentId, @type, @size, @hash, @created, @modified, @syncState)
             ON CONFLICT(id) DO UPDATE SET
                 remote_id = excluded.remote_id,
                 provider_id = excluded.provider_id,
@@ -225,7 +249,8 @@ public sealed class SqliteMetadataStore : IMetadataStore
                 type = excluded.type,
                 size = excluded.size,
                 content_hash = excluded.content_hash,
-                modified_at_utc = excluded.modified_at_utc
+                modified_at_utc = excluded.modified_at_utc,
+                sync_state = excluded.sync_state
             """;
         cmd.Parameters.AddWithValue("@id", item.Id);
         cmd.Parameters.AddWithValue("@remoteId", item.RemoteId);
@@ -238,6 +263,7 @@ public sealed class SqliteMetadataStore : IMetadataStore
         cmd.Parameters.AddWithValue("@hash", (object?)item.ContentHash ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@created", item.CreatedAtUtc.ToString("o"));
         cmd.Parameters.AddWithValue("@modified", item.ModifiedAtUtc.ToString("o"));
+        cmd.Parameters.AddWithValue("@syncState", (int)item.SyncState);
 
         await cmd.ExecuteNonQueryAsync(ct);
         return item;
@@ -280,6 +306,18 @@ public sealed class SqliteMetadataStore : IMetadataStore
         while (await reader.ReadAsync(ct))
             results.Add(ReadItem(reader));
         return results;
+    }
+
+    public async Task<CloudItem?> GetItemByRemoteIdAsync(string accountId, string remoteId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM items WHERE account_id = @accountId AND remote_id = @remoteId LIMIT 1";
+        cmd.Parameters.AddWithValue("@accountId", accountId);
+        cmd.Parameters.AddWithValue("@remoteId", remoteId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? ReadItem(reader) : null;
     }
 
     // ── Accounts ─────────────────────────────────────────────────────────
@@ -695,6 +733,93 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    // ── Conflicts ────────────────────────────────────────────────────────
+
+    public async Task<IReadOnlyList<FileConflict>> GetConflictsAsync(string? poolId = null, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = poolId == null
+            ? "SELECT * FROM conflicts ORDER BY detected_at_utc DESC"
+            : "SELECT * FROM conflicts WHERE pool_id = @poolId ORDER BY detected_at_utc DESC";
+        if (poolId != null)
+            cmd.Parameters.AddWithValue("@poolId", poolId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<FileConflict>();
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadConflict(reader));
+        return results;
+    }
+
+    public async Task<FileConflict?> GetConflictAsync(string conflictId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM conflicts WHERE conflict_id = @id";
+        cmd.Parameters.AddWithValue("@id", conflictId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? ReadConflict(reader) : null;
+    }
+
+    public async Task<FileConflict> UpsertConflictAsync(FileConflict conflict, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO conflicts (conflict_id, pool_id, item_id, relative_path, account_id, remote_id,
+                                   local_modified_utc, remote_modified_utc, local_size, remote_size, detected_at_utc)
+            VALUES (@id, @poolId, @itemId, @path, @accountId, @remoteId,
+                    @localMod, @remoteMod, @localSize, @remoteSize, @detected)
+            ON CONFLICT(conflict_id) DO UPDATE SET
+                local_modified_utc = excluded.local_modified_utc,
+                remote_modified_utc = excluded.remote_modified_utc,
+                local_size = excluded.local_size,
+                remote_size = excluded.remote_size,
+                remote_id = excluded.remote_id,
+                detected_at_utc = excluded.detected_at_utc
+            """;
+        cmd.Parameters.AddWithValue("@id", conflict.ConflictId);
+        cmd.Parameters.AddWithValue("@poolId", conflict.PoolId);
+        cmd.Parameters.AddWithValue("@itemId", conflict.ItemId);
+        cmd.Parameters.AddWithValue("@path", conflict.RelativePath);
+        cmd.Parameters.AddWithValue("@accountId", conflict.AccountId);
+        cmd.Parameters.AddWithValue("@remoteId", conflict.RemoteId);
+        cmd.Parameters.AddWithValue("@localMod", conflict.LocalModifiedUtc.ToString("o"));
+        cmd.Parameters.AddWithValue("@remoteMod", conflict.RemoteModifiedUtc.ToString("o"));
+        cmd.Parameters.AddWithValue("@localSize", conflict.LocalSize);
+        cmd.Parameters.AddWithValue("@remoteSize", conflict.RemoteSize);
+        cmd.Parameters.AddWithValue("@detected", conflict.DetectedAtUtc.ToString("o"));
+
+        await cmd.ExecuteNonQueryAsync(ct);
+        return conflict;
+    }
+
+    public async Task DeleteConflictAsync(string conflictId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM conflicts WHERE conflict_id = @id";
+        cmd.Parameters.AddWithValue("@id", conflictId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static FileConflict ReadConflict(SqliteDataReader reader) => new()
+    {
+        ConflictId = reader.GetString(reader.GetOrdinal("conflict_id")),
+        PoolId = reader.GetString(reader.GetOrdinal("pool_id")),
+        ItemId = reader.GetString(reader.GetOrdinal("item_id")),
+        RelativePath = reader.GetString(reader.GetOrdinal("relative_path")),
+        AccountId = reader.GetString(reader.GetOrdinal("account_id")),
+        RemoteId = reader.GetString(reader.GetOrdinal("remote_id")),
+        LocalModifiedUtc = ParseUtc(reader.GetString(reader.GetOrdinal("local_modified_utc"))),
+        RemoteModifiedUtc = ParseUtc(reader.GetString(reader.GetOrdinal("remote_modified_utc"))),
+        LocalSize = reader.GetInt64(reader.GetOrdinal("local_size")),
+        RemoteSize = reader.GetInt64(reader.GetOrdinal("remote_size")),
+        DetectedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("detected_at_utc")))
+    };
+
     // ── Notifications ────────────────────────────────────────────────────
 
     public async Task<IReadOnlyList<AppNotification>> GetNotificationsAsync(
@@ -834,8 +959,22 @@ public sealed class SqliteMetadataStore : IMetadataStore
             ? null
             : reader.GetString(reader.GetOrdinal("content_hash")),
         CreatedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("created_at_utc"))),
-        ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc")))
+        ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc"))),
+        SyncState = ReadSyncState(reader)
     };
+
+    private static SyncState ReadSyncState(SqliteDataReader reader)
+    {
+        try
+        {
+            var ord = reader.GetOrdinal("sync_state");
+            return reader.IsDBNull(ord) ? SyncState.Synced : (SyncState)reader.GetInt32(ord);
+        }
+        catch
+        {
+            return SyncState.Synced; // column missing in an older database
+        }
+    }
 
     private static ProviderAccount ReadAccount(SqliteDataReader reader)
     {

@@ -19,6 +19,7 @@ public partial class App : Application
     public static TrayIcon Tray { get; private set; } = null!;
     public static EmailCheckService? EmailChecker { get; private set; }
     public static PoolSyncService? SyncService { get; private set; }
+    public static RemoteSyncService? RemoteSync { get; private set; }
     public static ProviderConnectionManager Connection { get; private set; } = null!;
     public static ClouderConfig AppConfig { get; private set; } = new();
 
@@ -59,8 +60,13 @@ public partial class App : Application
             await Connection.ReconnectAllAsync();
 
             // CfApi sync engines disabled (crashes Explorer on this system).
-            // Instead, use PoolSyncService with FileSystemWatcher for local→cloud sync.
-            SyncService = new PoolSyncService(Store, Providers);
+            // Instead: PoolSyncService (FileSystemWatcher) for local→cloud, and
+            // RemoteSyncService (change polling) for cloud→local. They share the
+            // conflict handler and remote-root resolver so both directions agree.
+            var conflicts = new ConflictHandler(Store);
+            var roots = new RemoteRootResolver(Store);
+            SyncService = new PoolSyncService(Store, Providers, conflicts, roots);
+            RemoteSync = new RemoteSyncService(Store, Providers, conflicts, roots, SyncService);
             ApplyConfigToSync();
 
             // Apply auto-start preference to the Windows registry.
@@ -78,6 +84,7 @@ public partial class App : Application
             Tray.PauseChanged += paused =>
             {
                 if (SyncService != null) SyncService.Paused = paused;
+                if (RemoteSync != null) RemoteSync.Paused = paused;
                 ClouderLog.Info(paused ? "Sync paused" : "Sync resumed");
                 if (!paused) _ = SyncAllPoolsAsync();
             };
@@ -118,6 +125,11 @@ public partial class App : Application
         SyncService.MinFreeDiskBytes = AppConfig.MinFreeDiskMb > 0
             ? AppConfig.MinFreeDiskMb * 1024L * 1024L
             : 0;
+
+        if (RemoteSync == null) return;
+        RemoteSync.ConflictPolicy = AppConfig.ConflictPolicy;
+        RemoteSync.MaxDownloadBytesPerSec = AppConfig.MaxDownloadBytesPerSec;
+        RemoteSync.MinFreeDiskBytes = SyncService.MinFreeDiskBytes;
     }
 
     /// <summary>Re-read config from the store and apply everything live. Called by Settings page.</summary>
@@ -157,9 +169,21 @@ public partial class App : Application
         await Store.UpsertNotificationAsync(notification);
     }
 
+    /// <summary>
+    /// One full sync cycle: pull remote changes down first, then push local changes up.
+    /// Pulling first means a file changed in both places is detected as a conflict
+    /// before the uploader would blindly overwrite the cloud copy.
+    /// </summary>
     private static async Task SyncAllPoolsAsync()
     {
         if (SyncService == null) return;
+
+        if (RemoteSync is { Paused: false })
+        {
+            try { await RemoteSync.SyncAllPoolsAsync(); }
+            catch (Exception ex) { ClouderLog.Error("Remote (cloud→local) sync failed", ex); }
+        }
+
         try
         {
             var pools = await Store.GetAllPoolsAsync();

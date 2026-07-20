@@ -18,6 +18,150 @@ public sealed partial class FilesPage : Page
     private async void Page_Loaded(object sender, RoutedEventArgs e)
     {
         await LoadPoolsAsync();
+        await RefreshConflictBannerAsync();
+    }
+
+    // ── Conflicts ───────────────────────────────────────────────────────
+
+    private async Task RefreshConflictBannerAsync()
+    {
+        try
+        {
+            var conflicts = await App.Store.GetConflictsAsync();
+            ConflictBar.IsOpen = conflicts.Count > 0;
+            ConflictBar.Message = conflicts.Count == 1
+                ? $"\"{conflicts[0].RelativePath}\" changed both on this PC and in the cloud. "
+                  + "Neither copy has been changed — choose which one to keep."
+                : $"{conflicts.Count} files changed both on this PC and in the cloud. "
+                  + "No copies have been changed — choose which ones to keep.";
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error("Failed to load conflicts", ex);
+        }
+    }
+
+    private async void ResolveConflicts_Click(object sender, RoutedEventArgs e)
+    {
+        if (App.RemoteSync == null)
+        {
+            await ShowErrorAsync("Unavailable", "The sync service is not running.");
+            return;
+        }
+
+        var conflicts = await App.Store.GetConflictsAsync();
+        if (conflicts.Count == 0)
+        {
+            await RefreshConflictBannerAsync();
+            return;
+        }
+
+        var panel = new StackPanel { Spacing = 12 };
+        var choices = new List<(string ConflictId, ComboBox Selector)>();
+
+        panel.Children.Add(new InfoBar
+        {
+            Title = "Choose what to keep",
+            Message = "\"Keep both\" saves your local copy under a new name and downloads the cloud "
+                    + "version alongside it — the safest option when you're unsure.",
+            Severity = InfoBarSeverity.Informational,
+            IsOpen = true,
+            IsClosable = false
+        });
+
+        foreach (var conflict in conflicts)
+        {
+            var selector = new ComboBox
+            {
+                ItemsSource = new[] { "Keep both", "Keep the local copy", "Keep the cloud copy" },
+                SelectedIndex = 0,
+                HorizontalAlignment = HorizontalAlignment.Stretch
+            };
+
+            var card = new Border
+            {
+                Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(12),
+                Child = new StackPanel
+                {
+                    Spacing = 6,
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = conflict.RelativePath,
+                            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                            TextWrapping = TextWrapping.Wrap
+                        },
+                        new TextBlock
+                        {
+                            Text = $"This PC: {FormatBytes(conflict.LocalSize)}, edited {conflict.LocalModifiedUtc.ToLocalTime():g}",
+                            FontSize = 12,
+                            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+                        },
+                        new TextBlock
+                        {
+                            Text = $"Cloud: {FormatBytes(conflict.RemoteSize)}, edited {conflict.RemoteModifiedUtc.ToLocalTime():g}",
+                            FontSize = 12,
+                            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+                        },
+                        selector
+                    }
+                }
+            };
+
+            panel.Children.Add(card);
+            choices.Add((conflict.ConflictId, selector));
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"Resolve {conflicts.Count} conflict(s)",
+            Content = new ScrollViewer { Content = panel, MaxHeight = 500 },
+            PrimaryButtonText = "Apply",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        int resolved = 0, failed = 0;
+        foreach (var (conflictId, selector) in choices)
+        {
+            var choice = selector.SelectedIndex switch
+            {
+                1 => ConflictResolutionChoice.KeepLocal,
+                2 => ConflictResolutionChoice.KeepRemote,
+                _ => ConflictResolutionChoice.KeepBoth
+            };
+
+            try
+            {
+                if (await App.RemoteSync.ResolveConflictAsync(conflictId, choice)) resolved++;
+                else failed++;
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error($"Failed to resolve conflict '{conflictId}'", ex);
+                failed++;
+            }
+        }
+
+        await RefreshConflictBannerAsync();
+        await LoadFilesAsync();
+
+        await new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Conflicts resolved",
+            Content = failed == 0
+                ? $"Resolved {resolved} conflict(s)."
+                : $"Resolved {resolved} conflict(s). {failed} could not be resolved — check that the "
+                  + "account is connected and the cloud copy still exists.",
+            CloseButtonText = "OK"
+        }.ShowAsync();
     }
 
     private async Task LoadPoolsAsync()
@@ -109,7 +253,10 @@ public sealed partial class FilesPage : Page
                         VersionedVisible = versions.Count > 0 ? Visibility.Visible : Visibility.Collapsed,
                         IsStriped = isStriped,
                         StripedVisible = isStriped ? Visibility.Visible : Visibility.Collapsed,
-                        DownloadVisible = item.Type == CloudItemType.File ? Visibility.Visible : Visibility.Collapsed
+                        DownloadVisible = item.Type == CloudItemType.File ? Visibility.Visible : Visibility.Collapsed,
+                        StateBadgeText = StateLabel(item.SyncState),
+                        StateBadgeVisible = item.SyncState == SyncState.Synced ? Visibility.Collapsed : Visibility.Visible,
+                        StateBadgeBrush = StateBrush(item.SyncState)
                     });
                 }
             }
@@ -419,6 +566,20 @@ public sealed partial class FilesPage : Page
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    private static string StateLabel(SyncState state) => state switch
+    {
+        SyncState.PendingUpload => "Uploading",
+        SyncState.PendingDownload => "Downloading",
+        SyncState.Conflict => "Conflict",
+        _ => ""
+    };
+
+    private static Microsoft.UI.Xaml.Media.Brush StateBrush(SyncState state) => state switch
+    {
+        SyncState.Conflict => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.OrangeRed),
+        _ => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.SteelBlue)
+    };
+
     private static FrameworkElement SetColumn(FrameworkElement element, int col)
     {
         Grid.SetColumn(element, col);
@@ -495,5 +656,8 @@ public sealed partial class FilesPage : Page
         public bool IsStriped { get; set; }
         public Visibility StripedVisible { get; set; }
         public Visibility DownloadVisible { get; set; }
+        public required string StateBadgeText { get; set; }
+        public Visibility StateBadgeVisible { get; set; }
+        public required Microsoft.UI.Xaml.Media.Brush StateBadgeBrush { get; set; }
     }
 }

@@ -19,8 +19,12 @@ public sealed class PoolSyncService : IDisposable
     private readonly ConcurrentDictionary<string, DateTime> _debounce = [];
     private readonly ConcurrentDictionary<string, bool> _syncing = [];
     private readonly ConcurrentDictionary<string, int> _retryAttempts = [];
+    private readonly ConcurrentDictionary<string, DateTime> _suppressed = new(StringComparer.OrdinalIgnoreCase);
     private readonly TimeSpan _debounceDelay = TimeSpan.FromSeconds(2);
     private const int MaxRetryAttempts = 5;
+
+    private readonly RemoteRootResolver _roots;
+    private readonly ConflictHandler _conflicts;
     private Timer? _debounceTimer;
     private bool _disposed;
 
@@ -28,7 +32,11 @@ public sealed class PoolSyncService : IDisposable
     public bool Paused { get; set; }
 
     /// <summary>How to resolve a local file that conflicts with a newer cloud copy.</summary>
-    public ConflictResolution ConflictPolicy { get; set; } = ConflictResolution.NewestWins;
+    public ConflictResolution ConflictPolicy
+    {
+        get => _conflicts.Policy;
+        set => _conflicts.Policy = value;
+    }
 
     /// <summary>Size (bytes) above which a file is split across accounts. 0 = never.</summary>
     public long StripeThresholdBytes { get; set; }
@@ -64,11 +72,42 @@ public sealed class PoolSyncService : IDisposable
     /// <summary>Raised after a file is synced. Arg = (poolId, fileName, accountId).</summary>
     public event Action<string, string, string>? FileSynced;
 
-    public PoolSyncService(IMetadataStore store, IProviderRegistry providers)
+    public PoolSyncService(
+        IMetadataStore store,
+        IProviderRegistry providers,
+        ConflictHandler? conflicts = null,
+        RemoteRootResolver? roots = null)
     {
         _store = store;
         _providers = providers;
         _poolManager = new StoragePoolManager(store, providers);
+        _conflicts = conflicts ?? new ConflictHandler(store);
+        _roots = roots ?? new RemoteRootResolver(store);
+    }
+
+    // ── Watcher suppression (used while the downloader writes locally) ──
+
+    /// <summary>
+    /// Ignore file-watcher events for a path until the window expires. The cloud→local
+    /// downloader calls this so writing a downloaded file doesn't immediately queue it
+    /// for upload again.
+    /// </summary>
+    public void SuppressLocalWrites(string fullPath, TimeSpan window)
+    {
+        _suppressed[Path.GetFullPath(fullPath)] = DateTime.UtcNow + window;
+    }
+
+    private bool IsSuppressed(string fullPath)
+    {
+        string key;
+        try { key = Path.GetFullPath(fullPath); }
+        catch { return false; }
+
+        if (!_suppressed.TryGetValue(key, out var until)) return false;
+        if (DateTime.UtcNow <= until) return true;
+
+        _suppressed.TryRemove(key, out _);
+        return false;
     }
 
     /// <summary>
@@ -246,15 +285,20 @@ public sealed class PoolSyncService : IDisposable
                 ClouderLog.Error($"Failed to sync file '{filePath}'", ex);
                 failed++;
             }
-
-            progress?.Report(new SyncProgress
+            finally
             {
-                Total = total,
-                Completed = i + 1,
-                Synced = synced,
-                Skipped = skipped,
-                Failed = failed
-            });
+                // In a finally so that the `continue`s above (skipped files) still
+                // report — otherwise a sweep where everything is already in sync
+                // would never report progress at all.
+                progress?.Report(new SyncProgress
+                {
+                    Total = total,
+                    Completed = i + 1,
+                    Synced = synced,
+                    Skipped = skipped,
+                    Failed = failed
+                });
+            }
         }
 
         SyncStatusChanged?.Invoke(poolId, $"Sync complete: {synced} uploaded, {skipped} skipped, {failed} failed");
@@ -265,12 +309,14 @@ public sealed class PoolSyncService : IDisposable
 
     private void EnqueueSync(string poolId, string filePath)
     {
+        if (IsSuppressed(filePath)) return;
         var key = $"sync|{poolId}|{filePath}";
         _debounce[key] = DateTime.UtcNow;
     }
 
     private void EnqueueDelete(string poolId, string filePath)
     {
+        if (IsSuppressed(filePath)) return;
         var key = $"delete|{poolId}|{filePath}";
         _debounce[key] = DateTime.UtcNow;
     }
@@ -320,6 +366,7 @@ public sealed class PoolSyncService : IDisposable
     private async Task ProcessFileSyncAsync(string poolId, string filePath)
     {
         if (!File.Exists(filePath)) return;
+        if (IsSuppressed(filePath)) return; // queued before the downloader claimed this path
 
         // Skip hidden/system/temp files
         try
@@ -335,6 +382,22 @@ public sealed class PoolSyncService : IDisposable
 
         var pool = await _store.GetPoolAsync(poolId);
         if (pool == null) return;
+
+        // The watcher fires for any touch — including our own download writing the
+        // file. Only upload when the file is genuinely newer than what we last synced.
+        var relativePathForCheck = Path.GetRelativePath(pool.LocalPath, filePath);
+        var trackedForCheck = await FindTrackedFileAsync(poolId, relativePathForCheck);
+        if (trackedForCheck != null)
+        {
+            DateTime localModified;
+            try { localModified = File.GetLastWriteTimeUtc(filePath); }
+            catch { return; }
+
+            if (localModified <= trackedForCheck.ModifiedAtUtc) return;
+
+            if (!await ResolveConflictAsync(pool, filePath, relativePathForCheck, trackedForCheck, default))
+                return;
+        }
 
         var retryKey = $"sync|{poolId}|{filePath}";
         var gate = _uploadGate;
@@ -648,12 +711,12 @@ public sealed class PoolSyncService : IDisposable
         if (provider == null)
             throw new InvalidOperationException($"Provider '{account.ProviderId}' not registered. Reconnect the account.");
 
-        // Resolve or create the target folder in the cloud
-        var targetFolderId = "root";
+        // Everything this pool stores lives under its own remote folder.
+        var targetFolderId = await ResolveMemberRootAsync(pool, accountId, provider, ct);
         var relativeDir = Path.GetDirectoryName(relativePath);
         if (!string.IsNullOrEmpty(relativeDir))
         {
-            targetFolderId = await EnsureCloudFolderAsync(provider, accountId, relativeDir, ct);
+            targetFolderId = await EnsureCloudFolderAsync(provider, accountId, targetFolderId, relativeDir, ct);
         }
 
         // Upload the file (throttled if a speed cap is configured)
@@ -717,10 +780,10 @@ public sealed class PoolSyncService : IDisposable
             var provider = _providers.GetProvider(account.ProviderId)
                 ?? throw new InvalidOperationException($"Provider '{account.ProviderId}' not connected");
 
-            var targetFolderId = "root";
+            var targetFolderId = await ResolveMemberRootAsync(pool, plan.AccountId, provider, ct);
             var relativeDir = Path.GetDirectoryName(relativePath);
             if (!string.IsNullOrEmpty(relativeDir))
-                targetFolderId = await EnsureCloudFolderAsync(provider, plan.AccountId, relativeDir, ct);
+                targetFolderId = await EnsureCloudFolderAsync(provider, plan.AccountId, targetFolderId, relativeDir, ct);
 
             var chunkName = $"{fileName}.clpart{plan.ChunkIndex:D3}";
             SyncStatusChanged?.Invoke(pool.PoolId, $"Striping {fileName}: chunk {i + 1}/{ordered.Count} → {account.DisplayName}");
@@ -968,46 +1031,68 @@ public sealed class PoolSyncService : IDisposable
     // ── Conflict resolution ─────────────────────────────────────────────
 
     /// <summary>
-    /// Returns true if the local file should overwrite the cloud copy.
-    /// For KeepBoth, renames the local file so both survive.
+    /// Called before uploading a locally-changed file we've synced before. Checks whether
+    /// the cloud copy also changed since that sync and, if so, applies the conflict policy.
+    /// Returns true if the upload should proceed (the local copy wins).
     /// </summary>
-    private Task<bool> ResolveConflictAsync(
+    private async Task<bool> ResolveConflictAsync(
         StoragePool pool, string localFilePath, string relativePath, CloudItem existing, CancellationToken ct)
     {
-        // The cloud copy is only "newer" if its modified time is after the locally tracked one.
-        // We track ModifiedAtUtc at upload, so a remote that's strictly newer indicates an
-        // out-of-band change. With the current model the local edit is authoritative for
-        // NewestWins; KeepBoth preserves both by renaming the local file.
-        switch (ConflictPolicy)
+        // Striped files have no single remote object to compare against.
+        if (existing.ProviderId == StripedProviderMarker)
+            return true;
+
+        CloudItem? remote = null;
+        try
         {
-            case ConflictResolution.KeepBoth:
-                try
-                {
-                    var localModified = File.GetLastWriteTimeUtc(localFilePath);
-                    if (localModified > existing.ModifiedAtUtc)
-                        return Task.FromResult(true); // normal edit, just replace
-                }
-                catch { }
-                return Task.FromResult(true);
-
-            case ConflictResolution.AlwaysAsk:
-                // No interactive prompt available in the background service; default to
-                // the safe choice of keeping the newer local file.
-                return Task.FromResult(true);
-
-            case ConflictResolution.NewestWins:
-            default:
-                return Task.FromResult(true);
+            var provider = _providers.GetProvider(existing.ProviderId);
+            if (provider != null)
+                remote = await provider.GetItemAsync(existing.AccountId, existing.RemoteId, ct);
         }
+        catch (Exception ex)
+        {
+            ClouderLog.Warn($"Could not check the cloud copy of '{relativePath}': {ex.Message}");
+            return true; // can't tell — proceed with the local edit
+        }
+
+        // Gone remotely, or unchanged since our last sync: no conflict.
+        if (remote == null || remote.ModifiedAtUtc <= existing.ModifiedAtUtc)
+            return true;
+
+        long localSize;
+        DateTime localModified;
+        try
+        {
+            var info = new FileInfo(localFilePath);
+            localSize = info.Length;
+            localModified = info.LastWriteTimeUtc;
+        }
+        catch { return true; }
+
+        var outcome = await _conflicts.HandleAsync(
+            pool, relativePath, localFilePath, localModified, localSize, remote, existing.AccountId, ct);
+
+        // UseRemote / KeptBothTakeRemote / Deferred all mean "don't upload now".
+        // The remote sync pass brings the cloud copy down.
+        return outcome == ConflictOutcome.UseLocal;
     }
 
     private const string StripedProviderMarker = "clouder-striped";
 
+    /// <summary>The remote folder this pool owns on the given account (created on first use).</summary>
+    private async Task<string> ResolveMemberRootAsync(
+        StoragePool pool, string accountId, ICloudProvider provider, CancellationToken ct)
+    {
+        var member = pool.Members.FirstOrDefault(m => m.AccountId == accountId);
+        if (member == null) return "root";
+        return await _roots.EnsureAsync(provider, pool, member, ct);
+    }
+
     private async Task<string> EnsureCloudFolderAsync(
-        ICloudProvider provider, string accountId, string relativeFolderPath, CancellationToken ct)
+        ICloudProvider provider, string accountId, string baseFolderId, string relativeFolderPath, CancellationToken ct)
     {
         var parts = relativeFolderPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var currentParent = "root";
+        var currentParent = baseFolderId;
 
         foreach (var folderName in parts)
         {

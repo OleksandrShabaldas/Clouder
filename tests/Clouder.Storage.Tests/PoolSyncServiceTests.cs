@@ -1,13 +1,12 @@
 using Clouder.Core.Models;
-using Clouder.Core.Providers;
 using Clouder.Storage;
 
 namespace Clouder.Storage.Tests;
 
 /// <summary>
-/// Regression tests for PoolSyncService: a failed replacement upload must never
-/// destroy the existing cloud copy, deleting a local folder must propagate to every
-/// tracked file inside it, and sync counters must report what actually happened.
+/// Regression tests for PoolSyncService (local → cloud): a failed replacement upload
+/// must never destroy the existing cloud copy, deleting a local folder must propagate
+/// to every tracked file inside it, and sync counters must report what actually happened.
 /// </summary>
 public class PoolSyncServiceTests : IAsyncDisposable
 {
@@ -48,8 +47,8 @@ public class PoolSyncServiceTests : IAsyncDisposable
     public async Task ReplacementUploadFailure_KeepsOldCloudCopy()
     {
         await SetupPoolAsync();
-        var provider = new MemoryProvider();
-        using var svc = new PoolSyncService(_store, new OneProviderRegistry(provider));
+        var provider = new InMemoryCloudProvider();
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(provider));
 
         // First sync uploads the file.
         var filePath = Path.Combine(_poolDir, "a.txt");
@@ -59,7 +58,7 @@ public class PoolSyncServiceTests : IAsyncDisposable
         var item = await _store.GetItemAsync("p1|a.txt");
         Assert.NotNull(item);
         var oldRemote = item.RemoteId;
-        Assert.True(provider.Files.ContainsKey($"acc-1:{oldRemote}"));
+        Assert.True(provider.Exists(oldRemote));
 
         // Edit the file, then make the replacement upload fail.
         await File.WriteAllTextAsync(filePath, "version two — longer");
@@ -70,7 +69,7 @@ public class PoolSyncServiceTests : IAsyncDisposable
         await svc.SyncPoolAsync("p1", progress);
 
         // The upload failed — but the old cloud copy must still exist and still be tracked.
-        Assert.True(provider.Files.ContainsKey($"acc-1:{oldRemote}"),
+        Assert.True(provider.Exists(oldRemote),
             "old cloud copy was deleted even though the replacement upload failed");
         var itemAfterFailure = await _store.GetItemAsync("p1|a.txt");
         Assert.NotNull(itemAfterFailure);
@@ -85,8 +84,8 @@ public class PoolSyncServiceTests : IAsyncDisposable
         var itemAfterSuccess = await _store.GetItemAsync("p1|a.txt");
         Assert.NotNull(itemAfterSuccess);
         Assert.NotEqual(oldRemote, itemAfterSuccess.RemoteId);
-        Assert.True(provider.Files.ContainsKey($"acc-1:{itemAfterSuccess.RemoteId}"));
-        Assert.False(provider.Files.ContainsKey($"acc-1:{oldRemote}"),
+        Assert.True(provider.Exists(itemAfterSuccess.RemoteId));
+        Assert.False(provider.Exists(oldRemote),
             "replaced copy should be deleted after a successful re-upload");
     }
 
@@ -94,8 +93,8 @@ public class PoolSyncServiceTests : IAsyncDisposable
     public async Task FolderDeletion_RemovesAllTrackedChildrenFromCloud()
     {
         await SetupPoolAsync();
-        var provider = new MemoryProvider();
-        using var svc = new PoolSyncService(_store, new OneProviderRegistry(provider));
+        var provider = new InMemoryCloudProvider();
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(provider));
 
         var docsDir = Path.Combine(_poolDir, "docs");
         Directory.CreateDirectory(docsDir);
@@ -103,24 +102,25 @@ public class PoolSyncServiceTests : IAsyncDisposable
         await File.WriteAllTextAsync(Path.Combine(docsDir, "y.txt"), "yy");
         await svc.SyncPoolAsync("p1");
 
-        Assert.NotNull(await _store.GetItemAsync($"p1|docs{Path.DirectorySeparatorChar}x.txt"));
-        Assert.NotNull(await _store.GetItemAsync($"p1|docs{Path.DirectorySeparatorChar}y.txt"));
-        Assert.Equal(2, provider.Files.Count);
+        var sep = Path.DirectorySeparatorChar;
+        Assert.NotNull(await _store.GetItemAsync($"p1|docs{sep}x.txt"));
+        Assert.NotNull(await _store.GetItemAsync($"p1|docs{sep}y.txt"));
+        Assert.Equal(2, provider.FileCountUnder(InMemoryCloudProvider.RootId));
 
         // Delete the folder locally and propagate.
         Directory.Delete(docsDir, true);
         await svc.HandleLocalDeletionAsync("p1", docsDir);
 
-        Assert.Null(await _store.GetItemAsync($"p1|docs{Path.DirectorySeparatorChar}x.txt"));
-        Assert.Null(await _store.GetItemAsync($"p1|docs{Path.DirectorySeparatorChar}y.txt"));
-        Assert.Empty(provider.Files);
+        Assert.Null(await _store.GetItemAsync($"p1|docs{sep}x.txt"));
+        Assert.Null(await _store.GetItemAsync($"p1|docs{sep}y.txt"));
+        Assert.Equal(0, provider.FileCountUnder(InMemoryCloudProvider.RootId));
     }
 
     [Fact]
     public async Task NoConnectedProvider_CountsAsSkipped_NotUploaded()
     {
         await SetupPoolAsync();
-        using var svc = new PoolSyncService(_store, new OneProviderRegistry(null));
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(null));
 
         await File.WriteAllTextAsync(Path.Combine(_poolDir, "orphan.txt"), "data");
 
@@ -132,90 +132,30 @@ public class PoolSyncServiceTests : IAsyncDisposable
         Assert.Equal(1, last.Skipped);
         Assert.Equal(0, last.Failed);
     }
+
+    [Fact]
+    public async Task Uploads_LandUnderThePoolsOwnRemoteFolder()
+    {
+        await SetupPoolAsync();
+        var provider = new InMemoryCloudProvider();
+        using var svc = new PoolSyncService(_store, new SingleProviderRegistry(provider));
+
+        await File.WriteAllTextAsync(Path.Combine(_poolDir, "note.txt"), "hello");
+        await svc.SyncPoolAsync("p1");
+
+        // Not at the drive root — inside Clouder/Test Pool.
+        Assert.Null(provider.FindByPath(InMemoryCloudProvider.RootId, "note.txt"));
+        Assert.NotNull(provider.FindByPath(InMemoryCloudProvider.RootId, "Clouder/Test Pool/note.txt"));
+
+        // And the member now remembers that folder.
+        var pool = await _store.GetPoolAsync("p1");
+        Assert.NotNull(pool);
+        Assert.False(string.IsNullOrEmpty(pool.Members[0].RootFolderId));
+    }
 }
 
-// ── Test fakes ──────────────────────────────────────────────────────────
-
-file sealed class OneProviderRegistry(ICloudProvider? provider) : IProviderRegistry
-{
-    public ICloudProvider? GetProvider(string providerId) =>
-        provider != null && provider.ProviderId == providerId ? provider : null;
-    public IReadOnlyList<ICloudProvider> GetAllProviders() => provider == null ? [] : [provider];
-    public void Register(ICloudProvider p) { }
-}
-
-file sealed class CollectingProgress<T> : IProgress<T>
+internal sealed class CollectingProgress<T> : IProgress<T>
 {
     public List<T> Items { get; } = [];
     public void Report(T value) => Items.Add(value);
-}
-
-file sealed class MemoryProvider : ICloudProvider
-{
-    public Dictionary<string, byte[]> Files { get; } = new(); // "{accountId}:{remoteId}"
-    public bool FailNextUpload { get; set; }
-    private int _nextId = 1;
-
-    public string ProviderId => "fake";
-    public string DisplayName => "Fake";
-    public ProviderCapabilities Capabilities => ProviderCapabilities.Full;
-
-    public Task<StorageQuota> GetQuotaAsync(string accountId, CancellationToken ct = default) =>
-        Task.FromResult(new StorageQuota { TotalBytes = 1L << 40, UsedBytes = 0 });
-
-    public Task<CloudItem> UploadAsync(string accountId, string remoteFolderId, string fileName, Stream content, CancellationToken ct = default)
-    {
-        if (FailNextUpload)
-        {
-            FailNextUpload = false;
-            throw new IOException("simulated upload failure");
-        }
-        using var ms = new MemoryStream();
-        content.CopyTo(ms);
-        var id = $"r{_nextId++}";
-        Files[$"{accountId}:{id}"] = ms.ToArray();
-        return Task.FromResult(new CloudItem
-        {
-            Id = id, RemoteId = id, ProviderId = ProviderId, AccountId = accountId,
-            Name = fileName, Type = CloudItemType.File, Size = ms.Length,
-            CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
-        });
-    }
-
-    public Task DeleteAsync(string accountId, string remoteId, CancellationToken ct = default)
-    {
-        Files.Remove($"{accountId}:{remoteId}");
-        return Task.CompletedTask;
-    }
-
-    public Task<Stream> DownloadAsync(string accountId, string remoteId, CancellationToken ct = default)
-    {
-        if (!Files.TryGetValue($"{accountId}:{remoteId}", out var bytes))
-            throw new FileNotFoundException(remoteId);
-        return Task.FromResult<Stream>(new MemoryStream(bytes));
-    }
-
-    public Task<IReadOnlyList<CloudItem>> ListFolderAsync(string accountId, string remoteFolderId, CancellationToken ct = default) =>
-        Task.FromResult<IReadOnlyList<CloudItem>>([]);
-
-    public Task<CloudItem> CreateFolderAsync(string accountId, string parentRemoteId, string name, CancellationToken ct = default)
-    {
-        var id = $"folder-{_nextId++}";
-        return Task.FromResult(new CloudItem
-        {
-            Id = id, RemoteId = id, ProviderId = ProviderId, AccountId = accountId,
-            Name = name, Type = CloudItemType.Folder,
-            CreatedAtUtc = DateTime.UtcNow, ModifiedAtUtc = DateTime.UtcNow
-        });
-    }
-
-    public Task<ProviderAccount> ConnectAccountAsync(CancellationToken ct = default) => throw new NotImplementedException();
-    public Task DisconnectAccountAsync(string accountId, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<CloudItem?> GetItemAsync(string accountId, string remoteId, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<Stream> DownloadRangeAsync(string accountId, string remoteId, long offset, long length, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<CloudItem> MoveAsync(string accountId, string remoteId, string newParentRemoteId, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<CloudItem> RenameAsync(string accountId, string remoteId, string newName, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<IReadOnlyList<FileVersion>> GetVersionsAsync(string accountId, string remoteId, CancellationToken ct = default) =>
-        Task.FromResult<IReadOnlyList<FileVersion>>([]);
-    public Task<Stream> DownloadVersionAsync(string accountId, string remoteId, string versionId, CancellationToken ct = default) => throw new NotImplementedException();
 }

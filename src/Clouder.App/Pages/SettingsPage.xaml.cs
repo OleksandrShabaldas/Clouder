@@ -39,6 +39,7 @@ public sealed partial class SettingsPage : Page
 
         SyncIntervalBox.Value = _config.SyncIntervalSeconds;
         ConflictBox.SelectedItem = _config.ConflictPolicy.ToString();
+        UpdateConflictDescription(_config.ConflictPolicy);
         MaxConcurrentBox.Value = _config.MaxConcurrentTransfers;
         UploadLimitBox.Value = _config.MaxUploadBytesPerSec / (1024 * 1024);
         DownloadLimitBox.Value = _config.MaxDownloadBytesPerSec / (1024 * 1024);
@@ -76,10 +77,29 @@ public sealed partial class SettingsPage : Page
         _config.AutoReorganizeOnFull = AutoReorgToggle.IsOn;
     }
 
+    private static readonly Dictionary<ConflictResolution, string> ConflictDescriptions = new()
+    {
+        [ConflictResolution.NewestWins] =
+            "When a file changed both here and in the cloud, the version modified most recently "
+            + "replaces the other. Simple, but the older edit is lost.",
+        [ConflictResolution.KeepBoth] =
+            "Your local version is renamed to \"name (conflicted copy ...)\" and the cloud version is "
+            + "downloaded alongside it. Nothing is ever lost — recommended.",
+        [ConflictResolution.AlwaysAsk] =
+            "Neither copy is touched. The file is listed under Files → Resolve conflicts, where you "
+            + "choose which to keep."
+    };
+
+    private void UpdateConflictDescription(ConflictResolution policy)
+    {
+        ConflictDescription.Text = ConflictDescriptions.GetValueOrDefault(policy, "");
+    }
+
     private async void Setting_Changed(object sender, object e)
     {
         if (_loading) return;
         ReadConfigFromUI();
+        UpdateConflictDescription(_config.ConflictPolicy);
         await _configService.SaveAsync(_config);
         await App.ReloadConfigAsync();   // apply settings live (sync, auto-start, intervals)
         SaveIndicator.Text = $"Saved at {DateTime.Now:HH:mm:ss}";

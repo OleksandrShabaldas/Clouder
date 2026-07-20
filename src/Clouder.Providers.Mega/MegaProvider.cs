@@ -217,6 +217,57 @@ public sealed class MegaProvider : ICloudProvider
         return MapToCloudItem(renamed, accountId);
     }
 
+    // ── Change detection (full listing — MEGA has no change feed) ───────
+
+    public async Task<RemoteChangeSet> GetChangesAsync(
+        string accountId, string rootFolderId, string? cursor, CancellationToken ct = default)
+    {
+        var client = await GetClientAsync(accountId);
+        var nodes = await client.GetNodesAsync();
+
+        var root = rootFolderId is "root" or ""
+            ? nodes.Single(n => n.Type == NodeType.Root)
+            : nodes.FirstOrDefault(n => n.Id == rootFolderId);
+
+        // The sync root is gone (deleted remotely) — report nothing rather than
+        // claiming an empty listing, which the caller would read as "delete all".
+        if (root == null)
+            return new RemoteChangeSet { Cursor = cursor };
+
+        // Collect every descendant of the root by walking down from it.
+        var byParent = nodes
+            .Where(n => n.ParentId != null)
+            .GroupBy(n => n.ParentId!)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var result = new RemoteChangeSet { IsFullListing = true, Cursor = DateTime.UtcNow.ToString("o") };
+        var queue = new Queue<string>();
+        queue.Enqueue(root.Id);
+
+        while (queue.Count > 0)
+        {
+            var parentId = queue.Dequeue();
+            if (!byParent.TryGetValue(parentId, out var children)) continue;
+
+            foreach (var node in children)
+            {
+                if (node.Type is not (NodeType.File or NodeType.Directory)) continue;
+
+                result.Changes.Add(new RemoteChange
+                {
+                    RemoteId = node.Id,
+                    Type = RemoteChangeType.Upserted,
+                    Item = MapToCloudItem(node, accountId)
+                });
+
+                if (node.Type == NodeType.Directory)
+                    queue.Enqueue(node.Id);
+            }
+        }
+
+        return result;
+    }
+
     // ── Version history (not supported by MEGA) ─────────────────────────
 
     public Task<IReadOnlyList<FileVersion>> GetVersionsAsync(
@@ -288,7 +339,8 @@ public sealed class MegaProvider : ICloudProvider
             ProviderId = "mega",
             AccountId = accountId,
             Name = node.Name ?? "Root",
-            ParentId = null,
+            // Raw remote parent — the sync layer resolves paths from this.
+            ParentId = node.ParentId,
             Type = isFolder ? CloudItemType.Folder : CloudItemType.File,
             Size = isFolder ? 0 : node.Size,
             ContentHash = null,

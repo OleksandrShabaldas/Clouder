@@ -13,7 +13,9 @@ public enum ProviderCapabilities
     VersionHistory = 1 << 6,
     RangeDownload = 1 << 7,
     ContentHashing = 1 << 8,
+    /// <summary>Supports incremental change enumeration (vs. re-listing everything).</summary>
+    IncrementalChanges = 1 << 9,
 
     BasicReadWrite = Upload | Download | Delete | CreateFolder,
-    Full = BasicReadWrite | Move | Rename | VersionHistory | RangeDownload | ContentHashing
+    Full = BasicReadWrite | Move | Rename | VersionHistory | RangeDownload | ContentHashing | IncrementalChanges
 }

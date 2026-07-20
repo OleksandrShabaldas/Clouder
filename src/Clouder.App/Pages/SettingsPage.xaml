@@ -44,8 +44,13 @@
                     <NumberBox x:Name="SyncIntervalBox" Header="Sync interval (seconds)"
                                Minimum="30" Maximum="86400" SpinButtonPlacementMode="Inline"
                                ValueChanged="Setting_Changed" />
-                    <ComboBox x:Name="ConflictBox" Header="Conflict resolution"
-                              ItemsSource="{x:Bind ConflictOptions}" SelectionChanged="Setting_Changed" />
+                    <StackPanel Spacing="4">
+                        <ComboBox x:Name="ConflictBox" Header="Conflict resolution"
+                                  HorizontalAlignment="Stretch"
+                                  ItemsSource="{x:Bind ConflictOptions}" SelectionChanged="Setting_Changed" />
+                        <TextBlock x:Name="ConflictDescription" FontSize="12" TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
                     <NumberBox x:Name="MaxConcurrentBox" Header="Max concurrent transfers"
                                Minimum="1" Maximum="16" SpinButtonPlacementMode="Inline"
                                ValueChanged="Setting_Changed" />

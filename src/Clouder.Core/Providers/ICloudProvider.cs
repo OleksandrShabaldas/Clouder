@@ -26,4 +26,15 @@ public interface ICloudProvider
 
     Task<IReadOnlyList<FileVersion>> GetVersionsAsync(string accountId, string remoteId, CancellationToken ct = default);
     Task<Stream> DownloadVersionAsync(string accountId, string remoteId, string versionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Enumerates remote changes beneath <paramref name="rootFolderId"/> since
+    /// <paramref name="cursor"/>. Pass a null cursor to start tracking: providers
+    /// return an empty set with a fresh cursor rather than importing everything
+    /// that already exists remotely.
+    /// Providers without an incremental feed return every current item with
+    /// <see cref="RemoteChangeSet.IsFullListing"/> set.
+    /// </summary>
+    Task<RemoteChangeSet> GetChangesAsync(
+        string accountId, string rootFolderId, string? cursor, CancellationToken ct = default);
 }

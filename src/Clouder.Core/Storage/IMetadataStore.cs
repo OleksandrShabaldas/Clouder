@@ -14,6 +14,8 @@ public interface IMetadataStore : IAsyncDisposable
     Task<IReadOnlyList<CloudItem>> GetItemsByAccountAsync(string accountId, CancellationToken ct = default);
     /// <summary>Items whose id starts with the given prefix (e.g. "poolId|folder\") — used for folder-level operations.</summary>
     Task<IReadOnlyList<CloudItem>> GetItemsByIdPrefixAsync(string idPrefix, CancellationToken ct = default);
+    /// <summary>Finds a tracked item by its remote id on a given account — used to apply remote changes.</summary>
+    Task<CloudItem?> GetItemByRemoteIdAsync(string accountId, string remoteId, CancellationToken ct = default);
 
     // Accounts
     Task<ProviderAccount?> GetAccountAsync(string accountId, CancellationToken ct = default);
@@ -49,6 +51,12 @@ public interface IMetadataStore : IAsyncDisposable
     Task<IReadOnlyList<EmailAccountConfig>> GetAllEmailConfigsAsync(CancellationToken ct = default);
     Task<EmailAccountConfig> UpsertEmailConfigAsync(EmailAccountConfig config, CancellationToken ct = default);
     Task DeleteEmailConfigAsync(string configId, CancellationToken ct = default);
+
+    // Conflicts (files changed on both sides, awaiting user resolution)
+    Task<IReadOnlyList<FileConflict>> GetConflictsAsync(string? poolId = null, CancellationToken ct = default);
+    Task<FileConflict?> GetConflictAsync(string conflictId, CancellationToken ct = default);
+    Task<FileConflict> UpsertConflictAsync(FileConflict conflict, CancellationToken ct = default);
+    Task DeleteConflictAsync(string conflictId, CancellationToken ct = default);
 
     // Notifications
     Task<IReadOnlyList<AppNotification>> GetNotificationsAsync(int limit = 50, bool unreadOnly = false, CancellationToken ct = default);

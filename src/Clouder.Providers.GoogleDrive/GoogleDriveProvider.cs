@@ -108,7 +108,7 @@ public sealed class GoogleDriveProvider : ICloudProvider
 
         var listRequest = service.Files.List();
         listRequest.Q = $"'{remoteFolderId}' in parents and trashed = false";
-        listRequest.Fields = "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,md5Checksum)";
+        listRequest.Fields = "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,md5Checksum,parents)";
         listRequest.PageSize = 1000;
         listRequest.OrderBy = "folder,name";
 
@@ -279,6 +279,72 @@ public sealed class GoogleDriveProvider : ICloudProvider
         return await response.Content.ReadAsStreamAsync(ct);
     }
 
+    // ── Change detection ────────────────────────────────────────────────
+
+    public async Task<RemoteChangeSet> GetChangesAsync(
+        string accountId, string rootFolderId, string? cursor, CancellationToken ct = default)
+    {
+        var service = await CreateAuthenticatedServiceAsync(accountId, ct);
+
+        // No cursor yet: establish one and report nothing. Anything already in
+        // the folder was put there by us (or predates tracking) — importing it
+        // wholesale on first run would be a surprise mass download.
+        if (string.IsNullOrEmpty(cursor))
+        {
+            var start = await service.Changes.GetStartPageToken().ExecuteAsync(ct);
+            return new RemoteChangeSet { Cursor = start.StartPageTokenValue };
+        }
+
+        var result = new RemoteChangeSet();
+        var pageToken = cursor;
+
+        while (!string.IsNullOrEmpty(pageToken))
+        {
+            var request = service.Changes.List(pageToken);
+            request.Fields = "nextPageToken,newStartPageToken,changes(fileId,removed,file("
+                           + "id,name,mimeType,size,createdTime,modifiedTime,md5Checksum,parents,trashed))";
+            request.PageSize = 1000;
+            request.IncludeRemoved = true;
+
+            var response = await request.ExecuteAsync(ct);
+
+            foreach (var change in response.Changes ?? [])
+            {
+                if (string.IsNullOrEmpty(change.FileId)) continue;
+
+                // Removed from Drive entirely, moved to trash, or no longer visible.
+                if (change.Removed == true || change.File == null || change.File.Trashed == true)
+                {
+                    result.Changes.Add(new RemoteChange
+                    {
+                        RemoteId = change.FileId,
+                        Type = RemoteChangeType.Deleted
+                    });
+                    continue;
+                }
+
+                result.Changes.Add(new RemoteChange
+                {
+                    RemoteId = change.FileId,
+                    Type = RemoteChangeType.Upserted,
+                    Item = MapToCloudItem(change.File, accountId)
+                });
+            }
+
+            if (!string.IsNullOrEmpty(response.NewStartPageToken))
+            {
+                // Last page — this is the cursor to resume from next time.
+                result.Cursor = response.NewStartPageToken;
+                break;
+            }
+
+            pageToken = response.NextPageToken;
+        }
+
+        result.Cursor ??= cursor;
+        return result;
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────
 
     private async Task<DriveService> CreateAuthenticatedServiceAsync(string accountId, CancellationToken ct)
@@ -322,7 +388,8 @@ public sealed class GoogleDriveProvider : ICloudProvider
             ProviderId = "google-drive",
             AccountId = accountId,
             Name = file.Name ?? "Untitled",
-            ParentId = null,
+            // Raw remote parent — the sync layer resolves paths from this.
+            ParentId = file.Parents?.FirstOrDefault(),
             Type = isFolder ? CloudItemType.Folder : CloudItemType.File,
             Size = file.Size ?? 0,
             ContentHash = file.Md5Checksum,

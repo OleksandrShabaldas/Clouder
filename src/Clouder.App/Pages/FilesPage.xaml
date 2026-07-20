@@ -13,13 +13,22 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Files &amp; Version History" />
 
+        <!-- Conflict banner -->
+        <InfoBar x:Name="ConflictBar" Grid.Row="1" IsOpen="False" IsClosable="False"
+                 Severity="Warning" Title="Sync conflicts need your attention">
+            <InfoBar.ActionButton>
+                <Button Content="Resolve conflicts" Click="ResolveConflicts_Click" />
+            </InfoBar.ActionButton>
+        </InfoBar>
+
         <!-- Pool selector + search -->
-        <Grid Grid.Row="1" ColumnSpacing="12">
+        <Grid Grid.Row="2" ColumnSpacing="12">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
@@ -36,7 +45,7 @@
         </Grid>
 
         <!-- Stats bar -->
-        <Border Grid.Row="2" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+        <Border Grid.Row="3" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 CornerRadius="6" Padding="12,8">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -61,7 +70,7 @@
         </Border>
 
         <!-- File list -->
-        <ListView x:Name="FilesListView" Grid.Row="3" SelectionMode="None">
+        <ListView x:Name="FilesListView" Grid.Row="4" SelectionMode="None">
             <ListView.ItemTemplate>
                 <DataTemplate>
                     <Grid Margin="0,2" Padding="12,8" ColumnSpacing="12">
@@ -87,6 +96,10 @@
                                    MinWidth="100" />
                         <!-- Badges -->
                         <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                            <Border Visibility="{Binding StateBadgeVisible}" Background="{Binding StateBadgeBrush}"
+                                    CornerRadius="4" Padding="6,2">
+                                <TextBlock Text="{Binding StateBadgeText}" FontSize="10" Foreground="White" />
+                            </Border>
                             <Border Visibility="{Binding StripedVisible}" Background="{ThemeResource SystemFillColorCautionBackgroundBrush}"
                                     CornerRadius="4" Padding="6,2">
                                 <TextBlock Text="Striped" FontSize="10" />
@@ -112,7 +125,7 @@
             </ListView.ItemTemplate>
         </ListView>
 
-        <TextBlock x:Name="EmptyText" Grid.Row="3" Text="No files found. Select a pool or connect accounts to get started."
+        <TextBlock x:Name="EmptyText" Grid.Row="4" Text="No files found. Select a pool or connect accounts to get started."
                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                    HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
     </Grid>

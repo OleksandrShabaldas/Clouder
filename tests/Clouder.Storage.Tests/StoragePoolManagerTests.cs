@@ -430,4 +430,6 @@ file class FakeCloudProvider : ICloudProvider
     public Task<CloudItem> RenameAsync(string accountId, string remoteId, string newName, CancellationToken ct) => throw new NotImplementedException();
     public Task<IReadOnlyList<FileVersion>> GetVersionsAsync(string accountId, string remoteId, CancellationToken ct) => throw new NotImplementedException();
     public Task<Stream> DownloadVersionAsync(string accountId, string remoteId, string versionId, CancellationToken ct) => throw new NotImplementedException();
+    public Task<RemoteChangeSet> GetChangesAsync(string accountId, string rootFolderId, string? cursor, CancellationToken ct) =>
+        Task.FromResult(new RemoteChangeSet());
 }

@@ -207,4 +207,6 @@ internal sealed class RecordingProvider : ICloudProvider
     public Task<IReadOnlyList<FileVersion>> GetVersionsAsync(string accountId, string remoteId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<FileVersion>>([]);
     public Task<Stream> DownloadVersionAsync(string accountId, string remoteId, string versionId, CancellationToken ct = default) => throw new NotImplementedException();
+    public Task<RemoteChangeSet> GetChangesAsync(string accountId, string rootFolderId, string? cursor, CancellationToken ct = default) =>
+        Task.FromResult(new RemoteChangeSet());
 }
