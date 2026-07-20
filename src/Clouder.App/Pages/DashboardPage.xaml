@@ -8,29 +8,127 @@
     mc:Ignorable="d"
     Loaded="Page_Loaded">
 
-    <ScrollViewer Padding="24,16,24,16">
-        <StackPanel Spacing="24">
-            <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Dashboard" />
+    <ScrollViewer Padding="24,16,24,24">
+        <StackPanel Spacing="20">
 
-            <!-- Total Storage Card -->
-            <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    CornerRadius="8" Padding="20">
-                <StackPanel Spacing="12">
-                    <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Total Pooled Storage" />
-                    <ProgressBar x:Name="TotalStorageBar" Maximum="100" Value="0" Height="8" />
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="TotalStorageUsed" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                        <TextBlock x:Name="TotalStorageTotal" Grid.Column="1" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                    </Grid>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Dashboard" />
+                <Button Grid.Column="1" Click="Refresh_Click" VerticalAlignment="Center"
+                        ToolTipService.ToolTip="Refresh">
+                    <FontIcon Glyph="&#xE72C;" FontSize="14" />
+                </Button>
+            </Grid>
+
+            <!-- ── Headline figures ──────────────────────────────── -->
+            <Grid ColumnSpacing="12" x:Name="StatTiles">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        CornerRadius="8" Padding="16" BorderThickness="1"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="Pooled capacity" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="StatTotal" Text="—" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock x:Name="StatTotalSub" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="1" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        CornerRadius="8" Padding="16" BorderThickness="1"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="Used" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="StatUsed" Text="—" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock x:Name="StatUsedSub" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="2" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        CornerRadius="8" Padding="16" BorderThickness="1"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="Free" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="StatFree" Text="—" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock x:Name="StatFreeSub" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="3" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        CornerRadius="8" Padding="16" BorderThickness="1"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="Files synced" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="StatFiles" Text="—" FontSize="24" FontWeight="SemiBold" />
+                        <TextBlock x:Name="StatFilesSub" FontSize="12"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ── How the pool is composed ──────────────────────── -->
+            <Border x:Name="CompositionCard" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    CornerRadius="8" Padding="20" BorderThickness="1"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <StackPanel Spacing="14">
+                    <StackPanel Spacing="2">
+                        <TextBlock Text="Pooled storage by account" FontWeight="SemiBold" />
+                        <TextBlock Text="Each segment is one account, sized by its share of total capacity. The filled part is space already used."
+                                   FontSize="12" TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+
+                    <!-- Segments are built in code so widths stay proportional to capacity -->
+                    <Grid x:Name="CompositionBar" Height="34" ColumnSpacing="2" />
+
+                    <!-- Legend doubles as the direct labels the palette's contrast relief requires -->
+                    <ItemsRepeater x:Name="CompositionLegend">
+                        <ItemsRepeater.Layout>
+                            <UniformGridLayout MinItemWidth="220" MinItemHeight="26"
+                                               MinRowSpacing="4" MinColumnSpacing="12" />
+                        </ItemsRepeater.Layout>
+                        <ItemsRepeater.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Rectangle Width="10" Height="10" RadiusX="2" RadiusY="2"
+                                               Fill="{Binding Swatch}" VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="1" Text="{Binding Label}" FontSize="12"
+                                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="2" Text="{Binding Value}" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                               VerticalAlignment="Center" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsRepeater.ItemTemplate>
+                    </ItemsRepeater>
                 </StackPanel>
             </Border>
 
-            <!-- Accounts Overview -->
-            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Connected Accounts" />
+            <TextBlock x:Name="NoAccountsText" Text="No accounts connected yet. Open Accounts to add one."
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+
+            <!-- ── Per-account detail ────────────────────────────── -->
+            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Accounts" />
             <ItemsRepeater x:Name="AccountsList">
                 <ItemsRepeater.Layout>
                     <StackLayout Spacing="8" />
@@ -38,32 +136,52 @@
                 <ItemsRepeater.ItemTemplate>
                     <DataTemplate>
                         <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                                CornerRadius="8" Padding="16">
-                            <Grid ColumnSpacing="16">
+                                CornerRadius="8" Padding="16" BorderThickness="1"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                            <Grid ColumnSpacing="14">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
-                                <FontIcon Glyph="{Binding ProviderGlyph}" FontSize="24" VerticalAlignment="Center" />
-                                <StackPanel Grid.Column="1" Spacing="4">
-                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" />
-                                    <TextBlock Text="{Binding Email}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
-                                    <ProgressBar Maximum="100" Value="{Binding UsagePercent}" Height="4" Margin="0,4,0,0" />
+
+                                <Rectangle Width="4" Height="38" RadiusX="2" RadiusY="2"
+                                           Fill="{Binding Swatch}" VerticalAlignment="Center" />
+
+                                <StackPanel Grid.Column="1" Spacing="5">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Grid.Column="1" Text="{Binding StatusText}" FontSize="11"
+                                                   Foreground="{Binding StatusBrush}" VerticalAlignment="Center" />
+                                    </Grid>
+                                    <Grid Height="6" Background="{ThemeResource ControlAltFillColorSecondaryBrush}"
+                                          CornerRadius="3">
+                                        <Rectangle Fill="{Binding Swatch}" RadiusX="3" RadiusY="3"
+                                                   HorizontalAlignment="Left" Width="{Binding BarWidth}" />
+                                    </Grid>
+                                    <TextBlock Text="{Binding Email}" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                               TextTrimming="CharacterEllipsis" />
                                 </StackPanel>
-                                <TextBlock Grid.Column="2" Text="{Binding StorageText}" VerticalAlignment="Center"
-                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
+
+                                <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                    <TextBlock Text="{Binding UsageText}" FontSize="12" TextAlignment="Right" />
+                                    <TextBlock Text="{Binding FreeText}" FontSize="11" TextAlignment="Right"
+                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                </StackPanel>
                             </Grid>
                         </Border>
                     </DataTemplate>
                 </ItemsRepeater.ItemTemplate>
             </ItemsRepeater>
 
-            <TextBlock x:Name="NoAccountsText" Text="No accounts connected. Go to Accounts to add one."
-                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
-
-            <!-- Pools Overview -->
-            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Storage Pools" />
+            <!-- ── Pools ─────────────────────────────────────────── -->
+            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Storage pools" />
             <ItemsRepeater x:Name="PoolsList">
                 <ItemsRepeater.Layout>
                     <StackLayout Spacing="8" />
@@ -71,31 +189,106 @@
                 <ItemsRepeater.ItemTemplate>
                     <DataTemplate>
                         <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                                CornerRadius="8" Padding="16">
+                                CornerRadius="8" Padding="16" BorderThickness="1"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
                             <StackPanel Spacing="6">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
-                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4">
-                                        <Border Background="{ThemeResource SystemAccentColor}" CornerRadius="4" Padding="6,2">
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="13" />
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                        <Border Background="{ThemeResource AccentFillColorDefaultBrush}"
+                                                CornerRadius="4" Padding="6,2">
                                             <TextBlock Text="{Binding StrategyLabel}" FontSize="11" Foreground="White" />
+                                        </Border>
+                                        <Border Background="{ThemeResource ControlAltFillColorSecondaryBrush}"
+                                                CornerRadius="4" Padding="6,2">
+                                            <TextBlock Text="{Binding MemberCountLabel}" FontSize="11" />
                                         </Border>
                                     </StackPanel>
                                 </Grid>
-                                <TextBlock Text="{Binding SizeText}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
-                                <ProgressBar Maximum="100" Value="{Binding UsagePercent}" Height="4" />
-                                <TextBlock Text="{Binding MemberInfo}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
+                                <Grid Height="6" Background="{ThemeResource ControlAltFillColorSecondaryBrush}"
+                                      CornerRadius="3">
+                                    <Rectangle Fill="{ThemeResource AccentFillColorDefaultBrush}" RadiusX="3" RadiusY="3"
+                                               HorizontalAlignment="Left" Width="{Binding BarWidth}" />
+                                </Grid>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding SizeText}" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock Grid.Column="1" Text="{Binding LocalPath}" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                               TextTrimming="CharacterEllipsis" />
+                                </Grid>
                             </StackPanel>
                         </Border>
                     </DataTemplate>
                 </ItemsRepeater.ItemTemplate>
             </ItemsRepeater>
 
-            <TextBlock x:Name="NoPoolsText" Text="No pools configured. Go to Pools to create one."
+            <TextBlock x:Name="NoPoolsText" Text="No pools yet. Open Pools to create one."
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+
+            <!-- ── Recent activity ───────────────────────────────── -->
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Style="{StaticResource SubtitleTextBlockStyle}" Text="Recent activity" />
+                <TextBlock x:Name="ActivitySummary" Grid.Column="1" VerticalAlignment="Bottom" FontSize="12"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Grid>
+
+            <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    CornerRadius="8" Padding="8" BorderThickness="1"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <StackPanel>
+                    <ItemsRepeater x:Name="ActivityList">
+                        <ItemsRepeater.Layout>
+                            <StackLayout Spacing="0" />
+                        </ItemsRepeater.Layout>
+                        <ItemsRepeater.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnSpacing="12" Padding="8,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <!-- Icon + text, never colour alone -->
+                                    <FontIcon Glyph="{Binding Glyph}" FontSize="14" VerticalAlignment="Center"
+                                              Foreground="{Binding Tint}" />
+                                    <StackPanel Grid.Column="1" Spacing="1">
+                                        <TextBlock Text="{Binding FileName}" FontSize="13"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding Detail}" FontSize="11"
+                                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                    <TextBlock Grid.Column="2" Text="{Binding SizeText}" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                               VerticalAlignment="Center" MinWidth="70" TextAlignment="Right" />
+                                    <TextBlock Grid.Column="3" Text="{Binding TimeText}" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                               VerticalAlignment="Center" MinWidth="64" TextAlignment="Right" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsRepeater.ItemTemplate>
+                    </ItemsRepeater>
+
+                    <TextBlock x:Name="NoActivityText" Padding="8,10"
+                               Text="No transfers yet. Drop a file into a pool folder to get started."
+                               FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Visibility="Collapsed" />
+                </StackPanel>
+            </Border>
         </StackPanel>
     </ScrollViewer>
 </Page>
