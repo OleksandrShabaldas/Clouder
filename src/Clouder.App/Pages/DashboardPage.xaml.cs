@@ -27,12 +27,58 @@ public sealed partial class DashboardPage : Page
     private const string StatusGood = "#0ca30c";
     private const string StatusCritical = "#d03b3b";
 
+    private bool _subscribed;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _refreshTimer;
+
     public DashboardPage()
     {
         InitializeComponent();
     }
 
-    private async void Page_Loaded(object sender, RoutedEventArgs e) => await RefreshAsync();
+    private async void Page_Loaded(object sender, RoutedEventArgs e)
+    {
+        // Account verification runs in the background well after launch, so the states
+        // read below are still "Reconnecting". Without listening for the result the
+        // dashboard kept showing that until the page was rebuilt — which is why
+        // navigating to Accounts and back appeared to "fix" it.
+        if (!_subscribed && App.Connection != null)
+        {
+            App.Connection.StateChanged += OnConnectionStateChanged;
+            _subscribed = true;
+            Unloaded += (_, _) =>
+            {
+                if (App.Connection != null)
+                    App.Connection.StateChanged -= OnConnectionStateChanged;
+                _subscribed = false;
+                _refreshTimer?.Stop();
+            };
+        }
+
+        await RefreshAsync();
+    }
+
+    /// <summary>
+    /// Coalesces a burst of state changes into one rebuild. Verification touches every
+    /// account twice — Reconnecting, then the outcome — so four accounts produce eight
+    /// events in quick succession, and refreshing per event would re-run every query and
+    /// visibly flicker the composition bar.
+    /// </summary>
+    private void OnConnectionStateChanged()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            if (_refreshTimer == null)
+            {
+                _refreshTimer = DispatcherQueue.CreateTimer();
+                _refreshTimer.IsRepeating = false;
+                _refreshTimer.Tick += async (_, _) => await RefreshAsync();
+            }
+
+            _refreshTimer.Stop();
+            _refreshTimer.Interval = TimeSpan.FromMilliseconds(250);
+            _refreshTimer.Start();
+        });
+    }
 
     private async void Refresh_Click(object sender, RoutedEventArgs e) => await RefreshAsync();
 
