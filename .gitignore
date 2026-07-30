@@ -48,3 +48,10 @@ Desktop.ini
 
 ## Publish output
 publish/
+*.zip
+
+## Internal design docs and AI tooling — kept locally, not published
+CLAUDE.md
+AUDIT.md
+DECISIONS.md
+.claude/
