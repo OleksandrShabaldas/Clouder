@@ -32,6 +32,25 @@
                 </StackPanel>
             </Expander>
 
+            <!-- ── Updates ──────────────────────────────────────── -->
+            <Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <Expander.Header>
+                    <StackPanel Orientation="Horizontal" Spacing="12" Padding="0,8">
+                        <FontIcon Glyph="&#xE777;" />
+                        <TextBlock Text="Updates" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    </StackPanel>
+                </Expander.Header>
+                <StackPanel Spacing="16" Padding="4,8">
+                    <ToggleSwitch x:Name="AutoUpdateToggle" Header="Check for new versions automatically"
+                                  Toggled="Setting_Changed" />
+                    <NumberBox x:Name="UpdateIntervalBox" Header="Check every (hours)"
+                               Minimum="1" Maximum="720" SpinButtonPlacementMode="Inline"
+                               ValueChanged="Setting_Changed" />
+                    <TextBlock x:Name="UpdateStatusHint" FontSize="12" TextWrapping="Wrap"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+            </Expander>
+
             <!-- ── Explorer integration ─────────────────────────── -->
             <Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                 <Expander.Header>

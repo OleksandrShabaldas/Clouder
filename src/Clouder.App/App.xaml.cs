@@ -26,10 +26,12 @@ public partial class App : Application
     public static CacheEvictionService? CacheEviction { get; private set; }
     public static ProviderConnectionManager Connection { get; private set; } = null!;
     public static ClouderConfig AppConfig { get; private set; } = new();
+    public static UpdateService? Updates { get; private set; }
 
     private static readonly List<SyncEngine> Engines = [];
     private static System.Threading.Timer? _healthTimer;
     private static System.Threading.Timer? _periodicSyncTimer;
+    private static System.Threading.Timer? _updateTimer;
     private MainWindow? _window;
     private static MainWindow? _windowRef;
 
@@ -153,6 +155,11 @@ public partial class App : Application
         // Verify provider connections in the background (refreshes tokens/quota).
         // Then start file sync watchers once connections are confirmed.
         _ = VerifyAndStartSyncAsync();
+
+        // Updating the app has nothing to do with the cloud accounts, so this must not
+        // sit behind verification — an unreachable account can leave that awaiting a
+        // network timeout for minutes, and updates would silently never be checked.
+        StartUpdateChecks();
     }
 
     /// <summary>
@@ -281,6 +288,7 @@ public partial class App : Application
         ApplyConfigToSync();
         ApplyAutoStart(AppConfig.AutoStartOnLogin);
         RestartPeriodicSync();
+        RestartUpdateChecks();
 
         if (AppConfig.ExplorerIntegrationEnabled && !explorerWasOn)
             await EnableExplorerIntegrationAsync();
@@ -535,6 +543,160 @@ public partial class App : Application
             TimeSpan.FromMinutes(1), TimeSpan.FromHours(1));
     }
 
+    // ── Updates ─────────────────────────────────────────────────────────
+
+    private static bool _updatePromptOpen;
+
+    private static void StartUpdateChecks()
+    {
+        Updates = new UpdateService();
+
+        if (!Updates.IsSupported)
+        {
+            ClouderLog.Info("Update checks are off — Clouder is not running from an installed build");
+            return;
+        }
+
+        ClouderLog.Info($"Updater ready (current version {Updates.CurrentVersion ?? "unknown"})");
+        RestartUpdateChecks();
+    }
+
+    /// <summary>Re-arms the update timer from the current config. Called by the Settings page.</summary>
+    public static void RestartUpdateChecks()
+    {
+        _updateTimer?.Dispose();
+        _updateTimer = null;
+
+        if (Updates is not { IsSupported: true } || !AppConfig.AutoCheckForUpdates) return;
+
+        var interval = TimeSpan.FromHours(Math.Max(1, AppConfig.UpdateCheckIntervalHours));
+        // First check two minutes in, so it isn't competing with the initial sync sweep.
+        _updateTimer = new System.Threading.Timer(
+            _ => _ = RunAutomaticUpdateCheckAsync(), null, TimeSpan.FromMinutes(2), interval);
+    }
+
+    private static async Task RunAutomaticUpdateCheckAsync()
+    {
+        if (Updates is not { IsSupported: true }) return;
+
+        try
+        {
+            // Already downloaded and waiting for a restart — don't ask again on every tick.
+            if (Updates.IsRestartPending) return;
+
+            var info = await Updates.CheckAsync();
+            if (info == null) return;
+
+            var version = info.TargetFullRelease.Version.ToString();
+            ClouderLog.Info($"Update {version} available — downloading");
+            await Updates.DownloadAsync(info);
+            ClouderLog.Info($"Update {version} downloaded, pending restart");
+
+            OfferRestart(info, version);
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error("Automatic update check failed", ex);
+        }
+    }
+
+    /// <summary>
+    /// Asks whether to restart into the new version. A ContentDialog needs a visible
+    /// XamlRoot and Clouder spends most of its life minimized to the tray, so when the
+    /// window is hidden this falls back to a notification the user can act on later.
+    /// </summary>
+    public static void OfferRestart(Velopack.UpdateInfo info, string version)
+    {
+        var window = _windowRef;
+        bool canPrompt = window != null && !_updatePromptOpen;
+        try
+        {
+            canPrompt = canPrompt && window!.AppWindow.IsVisible;
+        }
+        catch
+        {
+            canPrompt = false;
+        }
+
+        if (!canPrompt)
+        {
+            _ = NotifyAsync(new AppNotification
+            {
+                NotificationId = $"update-ready-{version}",
+                Title = $"Clouder {version} is ready",
+                Body = "The update is downloaded. Restart Clouder to finish installing it.",
+                Source = "Updater",
+                Severity = NotificationSeverity.Info,
+                TimestampUtc = DateTime.UtcNow
+            });
+            return;
+        }
+
+        window!.DispatcherQueue.TryEnqueue(async () =>
+        {
+            if (_updatePromptOpen) return;
+            _updatePromptOpen = true;
+            try
+            {
+                var dialog = new Microsoft.UI.Xaml.Controls.ContentDialog
+                {
+                    XamlRoot = window.Content.XamlRoot,
+                    Title = $"Clouder {version} is ready",
+                    Content = "The update has been downloaded. Restarting takes a few seconds, "
+                            + "and any sync in progress resumes automatically afterwards.",
+                    PrimaryButtonText = "Restart now",
+                    CloseButtonText = "Later",
+                    DefaultButton = Microsoft.UI.Xaml.Controls.ContentDialogButton.Primary
+                };
+
+                if (await dialog.ShowAsync() == Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary)
+                    ApplyUpdateAndRestart(info.TargetFullRelease);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error("Update restart prompt failed", ex);
+            }
+            finally
+            {
+                _updatePromptOpen = false;
+            }
+        });
+    }
+
+    /// <summary>
+    /// Releases everything holding a file handle or the single-instance claim, then hands
+    /// off to Velopack, which swaps the install folder and relaunches.
+    ///
+    /// Releasing the mutex is not optional: the relaunched copy runs the same
+    /// single-instance check, and would see this process's claim and quit immediately.
+    /// </summary>
+    public static void ApplyUpdateAndRestart(Velopack.VelopackAsset asset)
+    {
+        if (Updates is not { IsSupported: true }) return;
+
+        ClouderLog.Info("Shutting down services for update");
+
+        _healthTimer?.Dispose();
+        _periodicSyncTimer?.Dispose();
+        _updateTimer?.Dispose();
+        SyncService?.Dispose();
+        EmailChecker?.Dispose();
+        foreach (var engine in Engines)
+            engine.Dispose();
+
+        try { Tray?.Dispose(); } catch { /* tray already gone */ }
+
+        try
+        {
+            _showWindowEvent?.Dispose();
+            _singleInstanceMutex?.ReleaseMutex();
+            _singleInstanceMutex?.Dispose();
+        }
+        catch { /* already released */ }
+
+        Updates.ApplyAndRestart(asset);
+    }
+
     private static void StartEmailMonitoring(MainWindow window)
     {
         try
@@ -589,6 +751,7 @@ public partial class App : Application
         ClouderLog.Info("Exit requested from tray");
         _healthTimer?.Dispose();
         _periodicSyncTimer?.Dispose();
+        _updateTimer?.Dispose();
         SyncService?.Dispose();
         EmailChecker?.Dispose();
         foreach (var engine in Engines)

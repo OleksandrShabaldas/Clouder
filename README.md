@@ -22,6 +22,7 @@ view anywhere.
 - [How the pooling works](#how-the-pooling-works)
 - [Features](#features)
 - [Install](#install)
+- [Updates](#updates)
 - [First run](#first-run)
 - [Connecting accounts](#connecting-accounts)
 - [Sync behaviour](#sync-behaviour)
@@ -147,20 +148,40 @@ Reorganization can also run automatically when a pool fills up.
 
 ## Install
 
-1. Download the latest `Clouder-win-x64.zip` from the
-   [Releases page](../../releases/latest).
-2. Unzip it anywhere — for example `C:\Program Files\Clouder` or a folder in your user
-   profile.
-3. Run `Clouder.App.exe`.
+1. Download `Clouder-Setup.exe` from the [Releases page](../../releases/latest).
+2. Run it. It installs to `%LOCALAPPDATA%\Clouder`, adds Start menu and desktop shortcuts,
+   and launches Clouder when it's done.
 
-No installer and no prerequisites: the build is self-contained, bundling both the .NET 8
-runtime and the Windows App SDK. That's why the download is large.
+No prerequisites: the build is self-contained, bundling both the .NET 8 runtime and the
+Windows App SDK. That's why the download is large — but see [Updates](#updates), which
+is why you only pay that cost once.
 
 **Requirements:** Windows 10 version 1809 (build 17763) or newer, 64-bit.
 
-SmartScreen will likely warn you on first launch, because the executable isn't code-signed
-(certificates cost money and this is a hobby project). *More info → Run anyway*, or build
-it yourself from source.
+SmartScreen will likely warn you, because the installer isn't code-signed (certificates
+cost money and this is a hobby project). *More info → Run anyway*, or build it yourself
+from source.
+
+There's also a `Clouder-win-x64-Portable.zip` if you'd rather not install — unzip it and
+run `Clouder.App.exe`. The portable build updates itself in place too.
+
+## Updates
+
+Clouder checks this repository's releases for a newer version every 24 hours, downloads
+what it finds, and then **asks** whether to restart — a sync or a large upload in progress
+is never interrupted without your say-so. If the window is minimized to the tray, you get
+a notification instead of a dialog, and the update waits.
+
+Updates are delta packages, so a typical one transfers a few MB rather than the full
+~140 MB. Most of that download is the .NET runtime and Windows App SDK, which rarely
+change between releases.
+
+- **Check manually:** About → *Check for updates*.
+- **Change the schedule or turn it off:** Settings → Updates.
+
+Updates only work when Clouder is running from an installed or portable Velopack build. If
+you run it straight out of a `dotnet publish` output folder, the update UI says so and
+does nothing rather than failing confusingly.
 
 ---
 
@@ -281,6 +302,8 @@ when the UI is unreachable. Enable it at Settings → Windows Explorer.
 | Min free disk | 1024 MB | Downloads stop rather than filling the drive |
 | Striping prompt threshold | 100 MB | Files above this may be offered striping |
 | Auto-reorganize when full | on | Shuffle files to make room instead of failing |
+| Check for updates automatically | on | Poll GitHub releases; you still choose when to restart |
+| Update check interval | 24 h | How often to poll |
 | Explorer integration | off | See the section above |
 
 ---

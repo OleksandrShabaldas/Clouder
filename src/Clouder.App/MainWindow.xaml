@@ -69,6 +69,13 @@
                     </NavigationViewItem.InfoBadge>
                 </NavigationViewItem>
             </NavigationView.MenuItems>
+            <NavigationView.FooterMenuItems>
+                <NavigationViewItem Content="About" Tag="about">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE946;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.FooterMenuItems>
             <Frame x:Name="NavFrame" />
         </NavigationView>
     </Grid>

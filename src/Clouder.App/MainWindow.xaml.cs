@@ -80,6 +80,7 @@ public sealed partial class MainWindow : Window
                 "pools" => typeof(PoolsPage),
                 "files" => typeof(FilesPage),
                 "notifications" => typeof(NotificationsPage),
+                "about" => typeof(AboutPage),
                 _ => typeof(DashboardPage)
             });
 

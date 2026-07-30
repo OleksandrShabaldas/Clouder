@@ -51,10 +51,32 @@ public sealed partial class SettingsPage : Page
         StripeThresholdBox.Value = _config.StripingPromptThresholdMb;
         AutoReorgToggle.IsOn = _config.AutoReorganizeOnFull;
 
+        AutoUpdateToggle.IsOn = _config.AutoCheckForUpdates;
+        UpdateIntervalBox.Value = _config.UpdateCheckIntervalHours;
+        UpdateUpdatesStatus();
+
         ExplorerToggle.IsOn = _config.ExplorerIntegrationEnabled;
         UpdateExplorerStatus();
 
         _loading = false;
+    }
+
+    private void UpdateUpdatesStatus()
+    {
+        if (App.Updates is not { IsSupported: true })
+        {
+            AutoUpdateToggle.IsEnabled = false;
+            UpdateIntervalBox.IsEnabled = false;
+            UpdateStatusHint.Text =
+                "Unavailable — Clouder is running from a plain build folder rather than an "
+                + "installed copy. Install it using the Setup on the Releases page to get updates.";
+            return;
+        }
+
+        UpdateStatusHint.Text =
+            "New versions are downloaded from this project's GitHub releases and only installed "
+            + "when you choose to restart, so a sync in progress is never interrupted. "
+            + "You can also check on demand from the About page.";
     }
 
     private void UpdateExplorerStatus()
@@ -95,6 +117,10 @@ public sealed partial class SettingsPage : Page
         _config.AutoReorganizeOnFull = AutoReorgToggle.IsOn;
 
         _config.ExplorerIntegrationEnabled = ExplorerToggle.IsOn;
+
+        _config.AutoCheckForUpdates = AutoUpdateToggle.IsOn;
+        _config.UpdateCheckIntervalHours = double.IsNaN(UpdateIntervalBox.Value)
+            ? 24 : Math.Max(1, (int)UpdateIntervalBox.Value);
     }
 
     private static readonly Dictionary<ConflictResolution, string> ConflictDescriptions = new()

@@ -31,6 +31,16 @@ public sealed class ClouderConfig
     public long StripingPromptThresholdMb { get; set; } = 100;
     public bool AutoReorganizeOnFull { get; set; } = true;
 
+    // Updates
+    /// <summary>
+    /// Check GitHub releases for a newer Clouder in the background. Found updates are
+    /// downloaded, then the user is asked whether to restart — sync is never interrupted
+    /// without consent.
+    /// </summary>
+    public bool AutoCheckForUpdates { get; set; } = true;
+
+    public int UpdateCheckIntervalHours { get; set; } = 24;
+
     /// <summary>
     /// Show pools in Explorer's sidebar with on-demand (placeholder) files, via the
     /// Windows Cloud Files API. Off by default: a faulty cloud-filter provider can hang
