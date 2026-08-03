@@ -34,6 +34,7 @@ public partial class App : Application
     private static System.Threading.Timer? _updateTimer;
     private MainWindow? _window;
     private static MainWindow? _windowRef;
+    private static TrayFlyoutWindow? _flyout;
 
     // ── Single instance ─────────────────────────────────────────────────
     // Two copies would run two sets of file watchers and tray icons against the
@@ -106,6 +107,7 @@ public partial class App : Application
             Tray = new TrayIcon();
             Tray.ShowWindowRequested += () => _window?.DispatcherQueue.TryEnqueue(ShowWindow);
             Tray.ExitRequested += () => _window?.DispatcherQueue.TryEnqueue(ExitApp);
+            Tray.FlyoutRequested += OnTrayFlyoutRequested;
             Tray.SyncRequested += () =>
             {
                 ClouderLog.Info("Manual sync triggered from tray");
@@ -746,7 +748,75 @@ public partial class App : Application
         _window.Activate();
     }
 
-    private void ExitApp()
+    /// <summary>
+    /// Opens (or toggles shut) the tray panel. The window is created once and reused;
+    /// it lives on the UI thread, while the click arrives on the tray's own thread.
+    /// </summary>
+    private static void OnTrayFlyoutRequested(int cursorX, int cursorY)
+    {
+        var window = _windowRef;
+        if (window == null) return;   // still starting up
+
+        window.DispatcherQueue.TryEnqueue(async () =>
+        {
+            try
+            {
+                _flyout ??= new TrayFlyoutWindow();
+
+                // Clicking the icon while the panel is open should shut it. The panel
+                // has already deactivated itself by the time this runs, so treat a
+                // click right after a dismissal as "close", not "open again".
+                if (DateTime.UtcNow - _flyout.LastHiddenUtc < TimeSpan.FromMilliseconds(300))
+                    return;
+
+                if (_flyout.IsOpen)
+                {
+                    _flyout.Dismiss();
+                    return;
+                }
+
+                await _flyout.ShowNearAsync(cursorX, cursorY);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error("Failed to open the tray panel", ex);
+            }
+        });
+    }
+
+    // ── Entry points used by the tray panel ─────────────────────────────
+
+    /// <summary>Brings the main window up, optionally on a specific page.</summary>
+    public static void ShowMainWindow(string? navTag = null)
+    {
+        var window = _windowRef;
+        if (window == null) return;
+
+        window.DispatcherQueue.TryEnqueue(() =>
+        {
+            try
+            {
+                window.AppWindow.Show();
+                window.Activate();
+                if (navTag != null) window.NavigateTo(navTag);
+            }
+            catch (Exception ex)
+            {
+                ClouderLog.Error("Could not show the main window", ex);
+            }
+        });
+    }
+
+    public static void RequestSyncNow()
+    {
+        ClouderLog.Info("Manual sync triggered from the tray panel");
+        _ = SyncAllPoolsAsync();
+    }
+
+    public static void RequestExit() =>
+        _windowRef?.DispatcherQueue.TryEnqueue(ExitApp);
+
+    private static void ExitApp()
     {
         ClouderLog.Info("Exit requested from tray");
         _healthTimer?.Dispose();
@@ -767,7 +837,7 @@ public partial class App : Application
         }
         catch { /* already gone */ }
 
-        _window?.Close();
+        _windowRef?.Close();
         Environment.Exit(0);
     }
 

@@ -42,6 +42,23 @@ public sealed partial class MainWindow : Window
         NotifBadge.Visibility = unreadCount > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
+    /// <summary>Navigates to a page by nav tag — used by the tray panel's shortcuts.</summary>
+    public void NavigateTo(string tag)
+    {
+        if (tag == "settings")
+        {
+            NavView.SelectedItem = NavView.SettingsItem;
+            return;
+        }
+
+        var item = NavView.MenuItems.Concat(NavView.FooterMenuItems)
+            .OfType<NavigationViewItem>()
+            .FirstOrDefault(i => (string?)i.Tag == tag);
+
+        if (item != null)
+            NavView.SelectedItem = item;   // raises SelectionChanged, which navigates
+    }
+
     private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
         // Respect the "Minimize to tray on close" setting.
@@ -79,6 +96,7 @@ public sealed partial class MainWindow : Window
                 "accounts" => typeof(AccountsPage),
                 "pools" => typeof(PoolsPage),
                 "files" => typeof(FilesPage),
+                "transfers" => typeof(TransferManagerPage),
                 "notifications" => typeof(NotificationsPage),
                 "about" => typeof(AboutPage),
                 _ => typeof(DashboardPage)

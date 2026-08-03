@@ -203,15 +203,82 @@ public sealed class StoragePoolManager : IStoragePoolManager
     }
 
     /// <summary>
-    /// Builds a stripe plan distributing <paramref name="fileSize"/> bytes across the pool's
-    /// connected members (largest free space first). Used to force-split a file.
+    /// Builds a plan that deliberately splits a file across the pool's members, used when
+    /// the user has asked for striping rather than when capacity forces it.
+    ///
+    /// This spreads the file evenly instead of greedily packing: the greedy planner gives
+    /// the emptiest account <c>min(free, wholeFile)</c>, which on an account with room to
+    /// spare is the entire file — so "stripe files over N MB" would produce a single chunk
+    /// and never actually split anything.
     /// </summary>
     public async Task<List<StripePlan>> BuildStripePlanForAsync(
         string poolId, long fileSize, CancellationToken ct = default)
     {
         var (_, members, quotas, effectiveFree) = await LoadPoolStateAsync(poolId, ct);
         if (members.Count == 0) return [];
-        return BuildStripePlan(members, effectiveFree, fileSize);
+        return BuildEvenStripePlan(members, effectiveFree, fileSize);
+    }
+
+    private static List<StripePlan> BuildEvenStripePlan(
+        List<PoolMember> members,
+        Dictionary<string, long> effectiveFree,
+        long fileSize)
+    {
+        var eligible = members
+            .Where(m => effectiveFree[m.AccountId] > 0)
+            .OrderByDescending(m => effectiveFree[m.AccountId])
+            .ThenBy(m => m.AccountId, StringComparer.Ordinal)
+            .ToList();
+
+        if (eligible.Count == 0 || fileSize <= 0) return [];
+
+        var share = new Dictionary<string, long>(StringComparer.Ordinal);
+        long remaining = fileSize;
+
+        // An equal share each, limited by what the account can actually hold.
+        long target = (long)Math.Ceiling(fileSize / (double)eligible.Count);
+        foreach (var member in eligible)
+        {
+            long take = Math.Min(Math.Min(target, effectiveFree[member.AccountId]), remaining);
+            if (take <= 0) continue;
+            share[member.AccountId] = take;
+            remaining -= take;
+        }
+
+        // Whatever the smaller accounts couldn't absorb goes to those with headroom.
+        foreach (var member in eligible)
+        {
+            if (remaining <= 0) break;
+            long already = share.GetValueOrDefault(member.AccountId);
+            long headroom = effectiveFree[member.AccountId] - already;
+            if (headroom <= 0) continue;
+
+            long take = Math.Min(headroom, remaining);
+            share[member.AccountId] = already + take;
+            remaining -= take;
+        }
+
+        if (remaining > 0) return []; // the pool can't hold it even when split
+
+        var plans = new List<StripePlan>();
+        long offset = 0;
+        int chunkIndex = 0;
+
+        foreach (var member in eligible)
+        {
+            if (!share.TryGetValue(member.AccountId, out var length) || length <= 0) continue;
+
+            plans.Add(new StripePlan
+            {
+                AccountId = member.AccountId,
+                ChunkIndex = chunkIndex++,
+                Offset = offset,
+                Length = length
+            });
+            offset += length;
+        }
+
+        return plans;
     }
 
     public async Task<PoolStatus> GetPoolStatusAsync(string poolId, CancellationToken ct = default)

@@ -66,6 +66,8 @@ public interface IMetadataStore : IAsyncDisposable
     Task<TransferStats> GetTransferStatsAsync(DateTime sinceUtc, CancellationToken ct = default);
     /// <summary>Trims history to the most recent <paramref name="keep"/> records.</summary>
     Task PruneTransfersAsync(int keep = 2000, CancellationToken ct = default);
+    /// <summary>Deletes transfer history; pass true to keep anything that isn't a success.</summary>
+    Task ClearTransfersAsync(bool onlyCompleted = false, CancellationToken ct = default);
 
     // Notifications
     Task<IReadOnlyList<AppNotification>> GetNotificationsAsync(int limit = 50, bool unreadOnly = false, CancellationToken ct = default);

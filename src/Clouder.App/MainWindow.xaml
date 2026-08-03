@@ -60,6 +60,11 @@
                         <FontIcon Glyph="&#xE8B7;" />
                     </NavigationViewItem.Icon>
                 </NavigationViewItem>
+                <NavigationViewItem Content="Transfers" Tag="transfers">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8AB;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
                 <NavigationViewItem x:Name="NavNotifications" Content="Notifications" Tag="notifications">
                     <NavigationViewItem.Icon>
                         <FontIcon Glyph="&#xEA8F;" />

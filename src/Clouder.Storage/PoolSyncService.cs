@@ -111,7 +111,8 @@ public sealed class PoolSyncService : IDisposable
     private async Task RecordTransferAsync(
         string poolId, string? accountId, string fileName, string? relativePath,
         TransferKind kind, TransferOutcome outcome, long bytes,
-        long startedAtMs, string? error = null, CancellationToken ct = default)
+        long startedAtMs, string? error = null, CancellationToken ct = default,
+        int chunkCount = 0, string? accountIds = null)
     {
         try
         {
@@ -127,7 +128,10 @@ public sealed class PoolSyncService : IDisposable
                 Bytes = bytes,
                 DurationMs = Math.Max(0, Environment.TickCount64 - startedAtMs),
                 TimestampUtc = DateTime.UtcNow,
-                Error = error
+                Error = error,
+                ItemId = relativePath != null ? $"{poolId}|{relativePath}" : null,
+                ChunkCount = chunkCount,
+                AccountIds = accountIds ?? accountId
             }, ct);
         }
         catch (Exception ex)
@@ -894,6 +898,7 @@ public sealed class PoolSyncService : IDisposable
         long totalSize = new FileInfo(localFilePath).Length;
         var ordered = plans.OrderBy(p => p.ChunkIndex).ToList();
         var saved = new List<StripePlan>();
+        long startedAtMs = Environment.TickCount64;
 
         for (int i = 0; i < ordered.Count; i++)
         {
@@ -956,6 +961,14 @@ public sealed class PoolSyncService : IDisposable
             }
             catch { _poolManager.Quotas.Invalidate(accId); }
         }
+
+        // Striped uploads were previously absent from the history entirely, so a split
+        // file looked like it had never synced. Record the logical file once, carrying
+        // the chunk count and every account involved.
+        await RecordTransferAsync(pool.PoolId, saved[0].AccountId, fileName, relativePath,
+            TransferKind.Upload, TransferOutcome.Success, totalSize, startedAtMs, ct: ct,
+            chunkCount: saved.Count,
+            accountIds: string.Join(",", saved.Select(p => p.AccountId).Distinct()));
 
         ClouderLog.Info($"Striped '{fileName}' into {saved.Count} chunk(s) across accounts");
         SyncStatusChanged?.Invoke(pool.PoolId, $"Striped {fileName} into {saved.Count} chunks");

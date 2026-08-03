@@ -19,6 +19,12 @@ public sealed class TrayIcon : IDisposable
     public event Action? SyncRequested;
     public event Action<bool>? PauseChanged;
 
+    /// <summary>
+    /// A left-click on the icon, with the cursor position in physical screen pixels so
+    /// the panel can be placed beside the tray on the right monitor.
+    /// </summary>
+    public event Action<int, int>? FlyoutRequested;
+
     public bool IsPaused => _paused;
 
     public void Start()
@@ -84,6 +90,15 @@ public sealed class TrayIcon : IDisposable
             Text = "Clouder",
             Visible = true,
             ContextMenuStrip = menu
+        };
+
+        // Left click opens the panel (like OneDrive/MEGA); right click keeps the menu;
+        // double click still opens the full window.
+        _icon.MouseClick += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            var pos = Cursor.Position;   // physical pixels, valid on this thread
+            FlyoutRequested?.Invoke(pos.X, pos.Y);
         };
         _icon.DoubleClick += (_, _) => ShowWindowRequested?.Invoke();
 

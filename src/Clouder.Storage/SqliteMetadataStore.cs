@@ -214,6 +214,14 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_transfers_time ON transfers(timestamp_utc DESC)", ct);
         await ExecuteNonQueryAsync(conn, "CREATE INDEX IF NOT EXISTS idx_transfers_pool ON transfers(pool_id)", ct);
 
+        try
+        {
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE transfers ADD COLUMN item_id TEXT", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE transfers ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE transfers ADD COLUMN account_ids TEXT", ct);
+        }
+        catch (SqliteException) { /* columns already exist */ }
+
         await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS email_configs (
                 config_id TEXT PRIMARY KEY,
@@ -875,9 +883,11 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO transfers (transfer_id, pool_id, account_id, file_name, relative_path,
-                                   kind, outcome, bytes, duration_ms, timestamp_utc, error)
+                                   kind, outcome, bytes, duration_ms, timestamp_utc, error,
+                                   item_id, chunk_count, account_ids)
             VALUES (@id, @poolId, @accountId, @fileName, @path,
-                    @kind, @outcome, @bytes, @duration, @timestamp, @error)
+                    @kind, @outcome, @bytes, @duration, @timestamp, @error,
+                    @itemId, @chunkCount, @accountIds)
             ON CONFLICT(transfer_id) DO NOTHING
             """;
         cmd.Parameters.AddWithValue("@id", record.TransferId);
@@ -891,7 +901,23 @@ public sealed class SqliteMetadataStore : IMetadataStore
         cmd.Parameters.AddWithValue("@duration", record.DurationMs);
         cmd.Parameters.AddWithValue("@timestamp", record.TimestampUtc.ToString("o"));
         cmd.Parameters.AddWithValue("@error", (object?)record.Error ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@itemId", (object?)record.ItemId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@chunkCount", record.ChunkCount);
+        cmd.Parameters.AddWithValue("@accountIds", (object?)record.AccountIds ?? DBNull.Value);
 
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Deletes transfer history. Pass true to keep entries that still need attention.</summary>
+    public async Task ClearTransfersAsync(bool onlyCompleted = false, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = onlyCompleted
+            ? "DELETE FROM transfers WHERE outcome = @success"
+            : "DELETE FROM transfers";
+        if (onlyCompleted)
+            cmd.Parameters.AddWithValue("@success", (int)TransferOutcome.Success);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
@@ -983,8 +1009,22 @@ public sealed class SqliteMetadataStore : IMetadataStore
         Bytes = reader.GetInt64(reader.GetOrdinal("bytes")),
         DurationMs = reader.GetInt64(reader.GetOrdinal("duration_ms")),
         TimestampUtc = ParseUtc(reader.GetString(reader.GetOrdinal("timestamp_utc"))),
-        Error = reader.IsDBNull(reader.GetOrdinal("error")) ? null : reader.GetString(reader.GetOrdinal("error"))
+        Error = reader.IsDBNull(reader.GetOrdinal("error")) ? null : reader.GetString(reader.GetOrdinal("error")),
+        ItemId = ReadStringOrNull(reader, "item_id"),
+        ChunkCount = (int)ReadLongOrZero(reader, "chunk_count"),
+        AccountIds = ReadStringOrNull(reader, "account_ids")
     };
+
+    /// <summary>Reads a text column that may not exist yet in an older database file.</summary>
+    private static string? ReadStringOrNull(SqliteDataReader reader, string column)
+    {
+        try
+        {
+            var ord = reader.GetOrdinal(column);
+            return reader.IsDBNull(ord) ? null : reader.GetString(ord);
+        }
+        catch { return null; }
+    }
 
     // ── Notifications ────────────────────────────────────────────────────
 

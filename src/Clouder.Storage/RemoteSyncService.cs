@@ -433,7 +433,9 @@ public sealed class RemoteSyncService
                 Bytes = bytes,
                 DurationMs = Math.Max(0, Environment.TickCount64 - startedAtMs),
                 TimestampUtc = DateTime.UtcNow,
-                Error = error
+                Error = error,
+                ItemId = relativePath != null ? $"{poolId}|{relativePath}" : null,
+                AccountIds = accountId
             }, ct);
         }
         catch (Exception ex)
