@@ -51,6 +51,29 @@
                 </StackPanel>
             </Expander>
 
+            <!-- ── File versions ────────────────────────────────── -->
+            <Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <Expander.Header>
+                    <StackPanel Orientation="Horizontal" Spacing="12" Padding="0,8">
+                        <FontIcon Glyph="&#xE81C;" />
+                        <TextBlock Text="File versions" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    </StackPanel>
+                </Expander.Header>
+                <StackPanel Spacing="16" Padding="4,8">
+                    <InfoBar IsOpen="True" IsClosable="False" Severity="Informational"
+                             Title="How versions work"
+                             Message="Each time a file is replaced by a newer copy, the old one is moved to a hidden versions folder in your cloud storage instead of being deleted. Open a file's details on the Files page to restore, save or delete a version. Versions use quota, so keep the limits sensible." />
+                    <ToggleSwitch x:Name="VersioningToggle" Header="Keep previous versions of files"
+                                  Toggled="Setting_Changed" />
+                    <NumberBox x:Name="MaxVersionsBox" Header="Versions to keep per file (0 = unlimited)"
+                               Minimum="0" Maximum="100" SpinButtonPlacementMode="Inline"
+                               ValueChanged="Setting_Changed" />
+                    <NumberBox x:Name="VersionDaysBox" Header="Delete versions older than (days, 0 = never)"
+                               Minimum="0" Maximum="3650" SpinButtonPlacementMode="Inline"
+                               ValueChanged="Setting_Changed" />
+                </StackPanel>
+            </Expander>
+
             <!-- ── Explorer integration ─────────────────────────── -->
             <Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                 <Expander.Header>

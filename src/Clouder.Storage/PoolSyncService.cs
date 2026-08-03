@@ -31,6 +31,11 @@ public sealed class PoolSyncService : IDisposable
     /// Explorer shows the "in sync" overlay and their space can later be freed.
     /// </summary>
     public Clouder.Core.Sync.IPlaceholderSink? Placeholders { get; set; }
+
+    /// <summary>
+    /// When set, the copy an edit replaces is kept as a version instead of being deleted.
+    /// </summary>
+    public FileVersionService? Versions { get; set; }
     private Timer? _debounceTimer;
     private bool _disposed;
 
@@ -568,6 +573,10 @@ public sealed class PoolSyncService : IDisposable
             try
             {
                 await DeleteCloudCopyAsync(tracked, ct);
+                // Retained versions live outside the pool folder, so nothing else would
+                // ever clean them up: the metadata rows cascade away with the item but
+                // the stored copies would be orphaned forever.
+                if (Versions != null) await Versions.DeleteAllVersionsAsync(tracked.Id, ct);
                 await _store.DeleteItemAsync(tracked.Id, ct);
                 ClouderLog.Info($"Deleted from cloud: {tracked.Name}");
                 SyncStatusChanged?.Invoke(poolId, $"Deleted {tracked.Name}");
@@ -590,6 +599,7 @@ public sealed class PoolSyncService : IDisposable
             try
             {
                 await DeleteCloudCopyAsync(child, ct);
+                if (Versions != null) await Versions.DeleteAllVersionsAsync(child.Id, ct);
                 await _store.DeleteItemAsync(child.Id, ct);
                 ClouderLog.Info($"Deleted from cloud (folder removal): {child.Name}");
             }
@@ -647,7 +657,7 @@ public sealed class PoolSyncService : IDisposable
             if (forcedPlans.Count >= 2)
             {
                 await UploadStripedAsync(pool, localFilePath, fileName, relativePath, forcedPlans, ct);
-                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                 return UploadOutcome.Uploaded;
             }
         }
@@ -656,12 +666,12 @@ public sealed class PoolSyncService : IDisposable
         {
             case PlacementOutcome.DirectPlace when decision.TargetAccountId != null:
                 await UploadToAccountAsync(pool, decision.TargetAccountId, localFilePath, fileName, relativePath, ct);
-                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                 return UploadOutcome.Uploaded;
 
             case PlacementOutcome.StripingRequired when decision.StripePlans is { Count: > 0 }:
                 await UploadStripedAsync(pool, localFilePath, fileName, relativePath, decision.StripePlans, ct);
-                await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                 return UploadOutcome.Uploaded;
 
             case PlacementOutcome.InsufficientSpace:
@@ -669,7 +679,7 @@ public sealed class PoolSyncService : IDisposable
                 // Delete it first (the data is safe in the local file) and re-decide.
                 if (existing != null)
                 {
-                    await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                    await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                     existing = null;
                     existingPlans = [];
                     var redecide = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
@@ -705,7 +715,7 @@ public sealed class PoolSyncService : IDisposable
                     if (afterReorg is { Outcome: PlacementOutcome.DirectPlace, TargetAccountId: not null })
                     {
                         await UploadToAccountAsync(pool, afterReorg.TargetAccountId, localFilePath, fileName, relativePath, ct);
-                        await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                        await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                         return UploadOutcome.Uploaded;
                     }
                 }
@@ -724,7 +734,7 @@ public sealed class PoolSyncService : IDisposable
                 if (fallbackMember != null)
                 {
                     await UploadToAccountAsync(pool, fallbackMember.AccountId, localFilePath, fileName, relativePath, ct);
-                    await DeleteReplacedCopyAsync(existing, existingPlans, ct);
+                    await DeleteReplacedCopyAsync(pool, existing, existingPlans, ct);
                     return UploadOutcome.Uploaded;
                 }
                 return UploadOutcome.NoSpace;
@@ -766,15 +776,21 @@ public sealed class PoolSyncService : IDisposable
     }
 
     /// <summary>
-    /// Deletes the pre-replacement cloud copy captured before an upload. Uses only the
-    /// in-memory snapshot — the store rows already describe the NEW copy by the time
-    /// this runs, so nothing is re-read (and stripe plans in the store are not touched).
-    /// Failures are logged, never thrown: worst case is a stray extra copy, not data loss.
+    /// Retires the pre-replacement cloud copy captured before an upload. With versioning
+    /// on, the copy is moved into the pool's versions folder and kept; otherwise it's
+    /// deleted. Uses only the in-memory snapshot — the store rows already describe the
+    /// NEW copy by the time this runs, so nothing is re-read (and stripe plans in the
+    /// store are not touched). Failures are logged, never thrown: worst case is a stray
+    /// extra copy, not data loss.
     /// </summary>
     private async Task DeleteReplacedCopyAsync(
-        CloudItem? oldItem, IReadOnlyList<StripePlan> oldPlans, CancellationToken ct = default)
+        StoragePool pool, CloudItem? oldItem, IReadOnlyList<StripePlan> oldPlans, CancellationToken ct = default)
     {
         if (oldItem == null) return;
+
+        // Keeping the old copy as a version replaces deleting it entirely.
+        if (Versions != null && await Versions.TryRetainAsync(pool, oldItem, oldPlans, ct))
+            return;
 
         if (oldPlans.Count > 0)
         {

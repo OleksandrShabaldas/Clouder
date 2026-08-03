@@ -47,4 +47,13 @@ public sealed class ClouderConfig
     /// or crash Explorer, so this stays opt-in until verified on the user's machine.
     /// </summary>
     public bool ExplorerIntegrationEnabled { get; set; }
+
+    // File versions — previous copies kept when a file is replaced
+    public bool FileVersioningEnabled { get; set; } = true;
+
+    /// <summary>Versions to keep per file. 0 = unlimited (bounded only by age).</summary>
+    public int MaxVersionsPerFile { get; set; } = 5;
+
+    /// <summary>Discard versions older than this many days. 0 = keep regardless of age.</summary>
+    public int VersionRetentionDays { get; set; }
 }

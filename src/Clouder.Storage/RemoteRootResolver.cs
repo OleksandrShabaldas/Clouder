@@ -18,6 +18,7 @@ namespace Clouder.Storage;
 public sealed class RemoteRootResolver
 {
     private const string ContainerFolderName = "Clouder";
+    private const string VersionsFolderName = ".versions";
 
     private readonly IMetadataStore _store;
     private readonly ConcurrentDictionary<string, string> _verified = new();
@@ -65,10 +66,34 @@ public sealed class RemoteRootResolver
         return poolFolderId;
     }
 
+    /// <summary>
+    /// The folder holding retained versions for this pool on the member's account:
+    /// <c>Clouder/.versions/{PoolName}</c>.
+    ///
+    /// Deliberately a sibling of the pool's sync root, not a child of it. Remote change
+    /// detection resolves paths relative to the sync root and ignores anything outside,
+    /// so old versions can never be mistaken for new remote files and downloaded back
+    /// into the pool — no name-based exclusion rule needed.
+    /// </summary>
+    public async Task<string> EnsureVersionsFolderAsync(
+        ICloudProvider provider, StoragePool pool, PoolMember member, CancellationToken ct = default)
+    {
+        var cacheKey = $"versions|{pool.PoolId}|{member.AccountId}";
+        if (_verified.TryGetValue(cacheKey, out var cached))
+            return cached;
+
+        var containerId = await FindOrCreateFolderAsync(provider, member.AccountId, "root", ContainerFolderName, ct);
+        var versionsId = await FindOrCreateFolderAsync(provider, member.AccountId, containerId, VersionsFolderName, ct);
+        var poolVersionsId = await FindOrCreateFolderAsync(provider, member.AccountId, versionsId, Sanitize(pool.Name), ct);
+
+        _verified[cacheKey] = poolVersionsId;
+        return poolVersionsId;
+    }
+
     /// <summary>Forgets cached verifications (e.g. after a pool is renamed or deleted).</summary>
     public void Invalidate(string poolId)
     {
-        foreach (var key in _verified.Keys.Where(k => k.StartsWith(poolId + "|", StringComparison.Ordinal)).ToList())
+        foreach (var key in _verified.Keys.Where(k => k.Contains(poolId, StringComparison.Ordinal)).ToList())
             _verified.TryRemove(key, out _);
     }
 

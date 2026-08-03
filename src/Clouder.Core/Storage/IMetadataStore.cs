@@ -31,9 +31,12 @@ public interface IMetadataStore : IAsyncDisposable
     Task<StoragePool> UpsertPoolAsync(StoragePool pool, CancellationToken ct = default);
     Task DeletePoolAsync(string poolId, CancellationToken ct = default);
 
-    // Versions
+    // Versions — retained copies of files that were replaced
     Task<IReadOnlyList<FileVersion>> GetFileVersionsAsync(string fileId, CancellationToken ct = default);
     Task<FileVersion> AddFileVersionAsync(FileVersion version, CancellationToken ct = default);
+    Task<FileVersion?> GetFileVersionAsync(string versionId, CancellationToken ct = default);
+    Task DeleteFileVersionAsync(string versionId, CancellationToken ct = default);
+    Task<IReadOnlyList<FileVersion>> GetAllFileVersionsAsync(CancellationToken ct = default);
 
     // Stripe records (for files split across providers)
     Task<IReadOnlyList<StripePlan>> GetStripePlansAsync(string fileId, CancellationToken ct = default);

@@ -263,11 +263,29 @@ internal sealed class InMemoryCloudProvider : ICloudProvider
 
     // ── Unused by these tests ───────────────────────────────────────────
 
+    public Task<CloudItem> MoveAsync(string accountId, string remoteId, string newParentRemoteId, CancellationToken ct = default)
+    {
+        if (!_nodes.TryGetValue(remoteId, out var node))
+            throw new FileNotFoundException(remoteId);
+
+        node.ParentId = newParentRemoteId;
+        Record(remoteId, deleted: false);
+        return Task.FromResult(Map(node, accountId));
+    }
+
+    public Task<CloudItem> RenameAsync(string accountId, string remoteId, string newName, CancellationToken ct = default)
+    {
+        if (!_nodes.TryGetValue(remoteId, out var node))
+            throw new FileNotFoundException(remoteId);
+
+        node.Name = newName;
+        Record(remoteId, deleted: false);
+        return Task.FromResult(Map(node, accountId));
+    }
+
     public Task<ProviderAccount> ConnectAccountAsync(CancellationToken ct = default) => throw new NotImplementedException();
     public Task DisconnectAccountAsync(string accountId, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<Stream> DownloadRangeAsync(string accountId, string remoteId, long offset, long length, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<CloudItem> MoveAsync(string accountId, string remoteId, string newParentRemoteId, CancellationToken ct = default) => throw new NotImplementedException();
-    public Task<CloudItem> RenameAsync(string accountId, string remoteId, string newName, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<IReadOnlyList<FileVersion>> GetVersionsAsync(string accountId, string remoteId, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<FileVersion>>([]);
     public Task<Stream> DownloadVersionAsync(string accountId, string remoteId, string versionId, CancellationToken ct = default) => throw new NotImplementedException();

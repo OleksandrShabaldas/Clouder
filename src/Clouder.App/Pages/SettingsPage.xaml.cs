@@ -55,6 +55,10 @@ public sealed partial class SettingsPage : Page
         UpdateIntervalBox.Value = _config.UpdateCheckIntervalHours;
         UpdateUpdatesStatus();
 
+        VersioningToggle.IsOn = _config.FileVersioningEnabled;
+        MaxVersionsBox.Value = _config.MaxVersionsPerFile;
+        VersionDaysBox.Value = _config.VersionRetentionDays;
+
         ExplorerToggle.IsOn = _config.ExplorerIntegrationEnabled;
         UpdateExplorerStatus();
 
@@ -117,6 +121,10 @@ public sealed partial class SettingsPage : Page
         _config.AutoReorganizeOnFull = AutoReorgToggle.IsOn;
 
         _config.ExplorerIntegrationEnabled = ExplorerToggle.IsOn;
+
+        _config.FileVersioningEnabled = VersioningToggle.IsOn;
+        _config.MaxVersionsPerFile = double.IsNaN(MaxVersionsBox.Value) ? 5 : (int)MaxVersionsBox.Value;
+        _config.VersionRetentionDays = double.IsNaN(VersionDaysBox.Value) ? 0 : (int)VersionDaysBox.Value;
 
         _config.AutoCheckForUpdates = AutoUpdateToggle.IsOn;
         _config.UpdateCheckIntervalHours = double.IsNaN(UpdateIntervalBox.Value)

@@ -24,6 +24,7 @@ public partial class App : Application
     public static HydrationService? Hydration { get; private set; }
     public static ToastNotifier? Toasts { get; private set; }
     public static CacheEvictionService? CacheEviction { get; private set; }
+    public static FileVersionService? Versions { get; private set; }
     public static ProviderConnectionManager Connection { get; private set; } = null!;
     public static ClouderConfig AppConfig { get; private set; } = new();
     public static UpdateService? Updates { get; private set; }
@@ -97,6 +98,10 @@ public partial class App : Application
             RemoteSync.Placeholders = PlaceholderSink;
             Hydration = new HydrationService(Store, Providers);
             CacheEviction = new CacheEvictionService(Store, PlaceholderSink);
+
+            // Previous copies are kept rather than deleted when a file is replaced.
+            Versions = new FileVersionService(Store, Providers, roots);
+            SyncService.Versions = Versions;
 
             ApplyConfigToSync();
 
@@ -273,6 +278,13 @@ public partial class App : Application
                 ? AppConfig.CacheSizeLimitMb * 1024L * 1024L
                 : 0;
             CacheEviction.DehydrateAfterDays = AppConfig.AutoDehydrateDays;
+        }
+
+        if (Versions != null)
+        {
+            Versions.Enabled = AppConfig.FileVersioningEnabled;
+            Versions.MaxVersionsPerFile = AppConfig.MaxVersionsPerFile;
+            Versions.RetentionDays = AppConfig.VersionRetentionDays;
         }
 
         if (RemoteSync == null) return;
@@ -530,9 +542,12 @@ public partial class App : Application
                     await NotifyAsync(alert);   // stores, toasts if enabled, updates the badge
 
                 // Housekeeping on the same hourly tick: free local disk for files that
-                // are safely in the cloud, and keep transfer history from growing forever.
+                // are safely in the cloud, discard versions past their retention age,
+                // and keep transfer history from growing forever.
                 if (CacheEviction != null)
                     await CacheEviction.RunAsync();
+                if (Versions != null)
+                    await Versions.PruneAllAsync();
                 await Store.PruneTransfersAsync();
             }
             catch (Exception ex)

@@ -222,6 +222,16 @@ public sealed class SqliteMetadataStore : IMetadataStore
         }
         catch (SqliteException) { /* columns already exist */ }
 
+        try
+        {
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE file_versions ADD COLUMN account_id TEXT", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE file_versions ADD COLUMN provider_id TEXT", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE file_versions ADD COLUMN version_number INTEGER NOT NULL DEFAULT 0", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE file_versions ADD COLUMN created_at_utc TEXT", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE file_versions ADD COLUMN chunk_manifest TEXT", ct);
+        }
+        catch (SqliteException) { /* columns already exist */ }
+
         await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS email_configs (
                 config_id TEXT PRIMARY KEY,
@@ -557,8 +567,10 @@ public sealed class SqliteMetadataStore : IMetadataStore
         await using var conn = await OpenConnectionAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO file_versions (version_id, remote_version_id, file_id, size, modified_at_utc, modified_by)
-            VALUES (@id, @remoteId, @fileId, @size, @modified, @modifiedBy)
+            INSERT INTO file_versions (version_id, remote_version_id, file_id, size, modified_at_utc, modified_by,
+                                       account_id, provider_id, version_number, created_at_utc, chunk_manifest)
+            VALUES (@id, @remoteId, @fileId, @size, @modified, @modifiedBy,
+                    @accountId, @providerId, @versionNumber, @created, @manifest)
             """;
         cmd.Parameters.AddWithValue("@id", version.VersionId);
         cmd.Parameters.AddWithValue("@remoteId", version.RemoteVersionId);
@@ -566,9 +578,48 @@ public sealed class SqliteMetadataStore : IMetadataStore
         cmd.Parameters.AddWithValue("@size", version.Size);
         cmd.Parameters.AddWithValue("@modified", version.ModifiedAtUtc.ToString("o"));
         cmd.Parameters.AddWithValue("@modifiedBy", (object?)version.ModifiedBy ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@accountId", (object?)version.AccountId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@providerId", (object?)version.ProviderId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@versionNumber", version.VersionNumber);
+        cmd.Parameters.AddWithValue("@created", version.CreatedAtUtc.ToString("o"));
+        cmd.Parameters.AddWithValue("@manifest", (object?)version.ChunkManifest ?? DBNull.Value);
 
         await cmd.ExecuteNonQueryAsync(ct);
         return version;
+    }
+
+    public async Task<FileVersion?> GetFileVersionAsync(string versionId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM file_versions WHERE version_id = @id";
+        cmd.Parameters.AddWithValue("@id", versionId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? ReadFileVersion(reader) : null;
+    }
+
+    public async Task DeleteFileVersionAsync(string versionId, CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM file_versions WHERE version_id = @id";
+        cmd.Parameters.AddWithValue("@id", versionId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Every retained version across all files — used to prune by age.</summary>
+    public async Task<IReadOnlyList<FileVersion>> GetAllFileVersionsAsync(CancellationToken ct = default)
+    {
+        await using var conn = await OpenConnectionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM file_versions ORDER BY created_at_utc DESC";
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var results = new List<FileVersion>();
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadFileVersion(reader));
+        return results;
     }
 
     // ── Stripe Plans ─────────────────────────────────────────────────────
@@ -1284,6 +1335,17 @@ public sealed class SqliteMetadataStore : IMetadataStore
         ModifiedAtUtc = ParseUtc(reader.GetString(reader.GetOrdinal("modified_at_utc"))),
         ModifiedBy = reader.IsDBNull(reader.GetOrdinal("modified_by"))
             ? null
-            : reader.GetString(reader.GetOrdinal("modified_by"))
+            : reader.GetString(reader.GetOrdinal("modified_by")),
+        AccountId = ReadStringOrNull(reader, "account_id"),
+        ProviderId = ReadStringOrNull(reader, "provider_id"),
+        VersionNumber = (int)ReadLongOrZero(reader, "version_number"),
+        CreatedAtUtc = ReadDateOrDefault(reader, "created_at_utc"),
+        ChunkManifest = ReadStringOrNull(reader, "chunk_manifest")
     };
+
+    private static DateTime ReadDateOrDefault(SqliteDataReader reader, string column)
+    {
+        var raw = ReadStringOrNull(reader, column);
+        return raw == null ? DateTime.MinValue : ParseUtc(raw);
+    }
 }

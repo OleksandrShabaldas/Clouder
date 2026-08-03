@@ -436,122 +436,118 @@ public sealed partial class FilesPage : Page
             });
         }
 
-        // Version history
-        if (versions.Count > 0)
+        // Version history — previous copies Clouder kept when the file was replaced.
+        var versionPanel = new StackPanel { Spacing = 6 };
+        versionPanel.Children.Add(new TextBlock
         {
-            var versionPanel = new StackPanel { Spacing = 4 };
+            Text = versions.Count > 0
+                ? $"Previous versions ({versions.Count})"
+                : "Previous versions",
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            FontSize = 13
+        });
+
+        if (versions.Count == 0)
+        {
             versionPanel.Children.Add(new TextBlock
             {
-                Text = $"Version History ({versions.Count} version(s))",
-                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-                FontSize = 13
-            });
-
-            foreach (var ver in versions.OrderByDescending(v => v.ModifiedAtUtc))
-            {
-                var verCard = new Border
-                {
-                    Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
-                    CornerRadius = new CornerRadius(6),
-                    Padding = new Thickness(12),
-                    Margin = new Thickness(0, 4, 0, 0),
-                    Child = new Grid
-                    {
-                        ColumnSpacing = 12,
-                        Children =
-                        {
-                            SetColumn(new StackPanel
-                            {
-                                Spacing = 2,
-                                Children =
-                                {
-                                    new TextBlock
-                                    {
-                                        Text = $"Version {ver.VersionId[..Math.Min(8, ver.VersionId.Length)]}",
-                                        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-                                        FontSize = 13
-                                    },
-                                    new TextBlock
-                                    {
-                                        Text = $"{ver.ModifiedAtUtc:g} | {FormatBytes(ver.Size)}"
-                                             + (ver.ModifiedBy != null ? $" | by {ver.ModifiedBy}" : ""),
-                                        FontSize = 12,
-                                        Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
-                                    }
-                                }
-                            }, 0)
-                        }
-                    }
-                };
-                versionPanel.Children.Add(verCard);
-            }
-
-            content.Children.Add(versionPanel);
-        }
-        else
-        {
-            content.Children.Add(new TextBlock
-            {
-                Text = "No version history available for this file.",
-                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
-                FontSize = 13
+                Text = App.AppConfig.FileVersioningEnabled
+                    ? "No previous versions yet. Clouder keeps a copy each time this file is "
+                      + "replaced by a newer one."
+                    : "Version history is turned off in Settings, so replaced copies are deleted "
+                      + "rather than kept.",
+                TextWrapping = TextWrapping.Wrap,
+                FontSize = 12,
+                Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
             });
         }
 
-        // Fetch from provider button
-        var fetchBtn = new Button
+        foreach (var ver in versions.OrderByDescending(v => v.VersionNumber))
         {
-            Content = new StackPanel
+            var where = ver.IsStriped
+                ? "split across accounts"
+                : ver.AccountId != null
+                    ? accountMap.GetValueOrDefault(ver.AccountId, ver.AccountId)
+                    : "unknown account";
+
+            var archived = ver.CreatedAtUtc == DateTime.MinValue
+                ? ""
+                : $" · kept {FormatTimeAgo(ver.CreatedAtUtc)}";
+
+            var info = new StackPanel
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
+                Spacing = 2,
                 Children =
                 {
-                    new FontIcon { Glyph = "", FontSize = 14 },
-                    new TextBlock { Text = "Fetch Versions from Provider" }
+                    new TextBlock
+                    {
+                        Text = $"Version {ver.VersionNumber}",
+                        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                        FontSize = 13
+                    },
+                    new TextBlock
+                    {
+                        Text = $"{FormatBytes(ver.Size)} · modified {ver.ModifiedAtUtc.ToLocalTime():g}{archived}",
+                        FontSize = 12,
+                        Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+                    },
+                    new TextBlock
+                    {
+                        Text = where,
+                        FontSize = 11,
+                        Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorTertiaryBrush"]
+                    }
                 }
-            },
-            Margin = new Thickness(0, 8, 0, 0)
-        };
-        fetchBtn.Click += async (_, _) =>
-        {
-            try
+            };
+
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+
+            var restoreBtn = new Button
             {
-                var provider = App.Providers.GetProvider(item.ProviderId);
-                if (provider == null)
-                {
-                    await ShowErrorAsync("Provider Unavailable",
-                        $"The {item.ProviderId} provider is not connected. Reconnect the account first.");
-                    return;
-                }
+                Content = new FontIcon { Glyph = "\uE777", FontSize = 13 },
+                Padding = new Thickness(8, 5, 8, 5)
+            };
+            ToolTipService.SetToolTip(restoreBtn, "Restore this version");
+            restoreBtn.Click += async (_, _) => await RestoreVersionAsync(ver, item.Name);
 
-                if (!provider.Capabilities.HasFlag(Clouder.Core.Providers.ProviderCapabilities.VersionHistory))
-                {
-                    await ShowErrorAsync("Not Supported",
-                        $"The {provider.DisplayName} provider does not support version history.");
-                    return;
-                }
-
-                fetchBtn.IsEnabled = false;
-                var fetched = await provider.GetVersionsAsync(item.AccountId, item.RemoteId);
-                foreach (var v in fetched)
-                {
-                    v.FileId = item.Id;
-                    await App.Store.AddFileVersionAsync(v);
-                }
-
-                await ShowErrorAsync("Versions Fetched",
-                    $"Retrieved {fetched.Count} version(s) from {provider.DisplayName}.");
-                fetchBtn.IsEnabled = true;
-            }
-            catch (Exception ex)
+            var saveBtn = new Button
             {
-                ClouderLog.Error("Failed to fetch versions", ex);
-                await ShowErrorAsync("Error", ex.Message);
-                fetchBtn.IsEnabled = true;
-            }
-        };
-        content.Children.Add(fetchBtn);
+                Content = new FontIcon { Glyph = "\uE896", FontSize = 13 },
+                Padding = new Thickness(8, 5, 8, 5)
+            };
+            ToolTipService.SetToolTip(saveBtn, "Save a copy to Downloads");
+            saveBtn.Click += async (_, _) => await SaveVersionCopyAsync(ver, item.Name);
+
+            var deleteBtn = new Button
+            {
+                Content = new FontIcon { Glyph = "\uE74D", FontSize = 13 },
+                Padding = new Thickness(8, 5, 8, 5)
+            };
+            ToolTipService.SetToolTip(deleteBtn, "Delete this version");
+            deleteBtn.Click += async (_, _) => await DeleteVersionAsync(ver);
+
+            actions.Children.Add(restoreBtn);
+            actions.Children.Add(saveBtn);
+            actions.Children.Add(deleteBtn);
+
+            var row = new Grid { ColumnSpacing = 12 };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            Grid.SetColumn(info, 0);
+            Grid.SetColumn(actions, 1);
+            row.Children.Add(info);
+            row.Children.Add(actions);
+
+            versionPanel.Children.Add(new Border
+            {
+                Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(12),
+                Child = row
+            });
+        }
+
+        content.Children.Add(versionPanel);
 
         var dialog = new ContentDialog
         {
@@ -562,6 +558,100 @@ public sealed partial class FilesPage : Page
         };
 
         await dialog.ShowAsync();
+    }
+
+    // ── Version actions ─────────────────────────────────────────────────
+
+    private async Task RestoreVersionAsync(FileVersion version, string fileName)
+    {
+        if (App.Versions == null) return;
+
+        var confirm = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"Restore version {version.VersionNumber}?",
+            Content = $"\"{fileName}\" will be put back to the version from "
+                    + $"{version.ModifiedAtUtc.ToLocalTime():g}. The copy that is current now is "
+                    + "kept as a version too, so this can be undone.",
+            PrimaryButtonText = "Restore",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary
+        };
+        if (await confirm.ShowAsync() != ContentDialogResult.Primary) return;
+
+        try
+        {
+            var path = await App.Versions.RestoreAsync(version.VersionId);
+
+            // Push it to the cloud now rather than waiting for the next sweep.
+            var poolId = version.FileId[..version.FileId.IndexOf('|')];
+            if (App.SyncService != null)
+                await App.SyncService.SyncPoolAsync(poolId);
+
+            await LoadFilesAsync();
+            await ShowErrorAsync("Version restored",
+                $"\"{fileName}\" is back to version {version.VersionNumber}.\n\nSaved to: {path}");
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error($"Failed to restore version {version.VersionNumber}", ex);
+            await ShowErrorAsync("Restore failed", ex.Message);
+        }
+    }
+
+    private async Task SaveVersionCopyAsync(FileVersion version, string fileName)
+    {
+        if (App.Versions == null) return;
+
+        try
+        {
+            var stem = Path.GetFileNameWithoutExtension(fileName);
+            var ext = Path.GetExtension(fileName);
+            var target = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads",
+                $"{stem} (v{version.VersionNumber}){ext}");
+
+            await App.Versions.SaveVersionAsAsync(version.VersionId, target);
+
+            try { System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{target}\""); }
+            catch { }
+
+            await ShowErrorAsync("Copy saved", $"Version {version.VersionNumber} saved to:\n{target}");
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error($"Failed to save version {version.VersionNumber}", ex);
+            await ShowErrorAsync("Could not save the copy", ex.Message);
+        }
+    }
+
+    private async Task DeleteVersionAsync(FileVersion version)
+    {
+        if (App.Versions == null) return;
+
+        var confirm = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"Delete version {version.VersionNumber}?",
+            Content = "This removes the stored copy permanently. The current version of the "
+                    + "file is not affected.",
+            PrimaryButtonText = "Delete",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close
+        };
+        if (await confirm.ShowAsync() != ContentDialogResult.Primary) return;
+
+        try
+        {
+            await App.Versions.DeleteVersionAsync(version.VersionId);
+            await LoadFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            ClouderLog.Error($"Failed to delete version {version.VersionNumber}", ex);
+            await ShowErrorAsync("Could not delete the version", ex.Message);
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
