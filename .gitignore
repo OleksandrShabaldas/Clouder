@@ -55,3 +55,6 @@ CLAUDE.md
 AUDIT.md
 DECISIONS.md
 .claude/
+
+## Velopack release output
+releases/
