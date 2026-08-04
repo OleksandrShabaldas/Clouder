@@ -772,7 +772,8 @@ public sealed partial class PoolsPage : Page
             IsClosable = false
         });
 
-        var controls = new List<(string AccountId, NumberBox Tier, ToggleSwitch Enabled, NumberBox Cap, NumberBox Reserve)>();
+        var controls = new List<(string AccountId, NumberBox Tier, ToggleSwitch Enabled, NumberBox Cap,
+                                 NumberBox Reserve, CheckBox VersionStore, CheckBox ExcludeFiles)>();
 
         foreach (var member in pool.Members.OrderBy(m => m.Priority).ThenBy(m => m.AccountId, StringComparer.Ordinal))
         {
@@ -796,6 +797,20 @@ public sealed partial class PoolsPage : Page
                 Header = "Use this account",
                 IsOn = member.IsEnabled
             };
+
+            var versionStoreCheck = new CheckBox
+            {
+                Content = "Can hold previous versions",
+                IsChecked = member.IsVersionStore
+            };
+
+            var excludeCheck = new CheckBox
+            {
+                Content = "Keep ordinary files off this account",
+                IsChecked = member.ExcludeFromFilePlacement
+            };
+            ToolTipService.SetToolTip(excludeCheck,
+                "Tick both to make this account an archive: versions live here, live files never do.");
 
             var capBox = new NumberBox
             {
@@ -848,12 +863,13 @@ public sealed partial class PoolsPage : Page
                 Child = new StackPanel
                 {
                     Spacing = 10,
-                    Children = { topRow, limitsGrid, enabledSwitch }
+                    Children = { topRow, limitsGrid, enabledSwitch, versionStoreCheck, excludeCheck }
                 }
             };
 
             panel.Children.Add(card);
-            controls.Add((member.AccountId, tierBox, enabledSwitch, capBox, reserveBox));
+            controls.Add((member.AccountId, tierBox, enabledSwitch, capBox, reserveBox,
+                          versionStoreCheck, excludeCheck));
         }
 
         var dialog = new ContentDialog
@@ -868,19 +884,31 @@ public sealed partial class PoolsPage : Page
 
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
-        foreach (var (accountId, tier, enabled, cap, reserve) in controls)
+        foreach (var (accountId, tier, enabled, cap, reserve, versionStore, excludeFiles) in controls)
         {
             var member = pool.Members.First(m => m.AccountId == accountId);
             member.Priority = (int)tier.Value;
             member.IsEnabled = enabled.IsOn;
             member.MaxUsageBytes = GbToBytes(cap.Value);
             member.ReserveBytes = GbToBytes(reserve.Value);
+            member.IsVersionStore = versionStore.IsChecked == true;
+            member.ExcludeFromFilePlacement = excludeFiles.IsChecked == true;
         }
 
-        if (!pool.Members.Any(m => m.IsEnabled))
+        // Excluding every account would leave nowhere for files to go.
+        if (!pool.Members.Any(m => m.IsEnabled && !m.ExcludeFromFilePlacement))
         {
-            await ShowErrorAsync("At least one account is required",
-                "A pool needs one enabled account to store anything. Nothing was changed.");
+            await ShowErrorAsync("Nowhere left for files",
+                "At least one account has to accept ordinary files. Nothing was changed.");
+            return;
+        }
+
+        if (pool.VersionPolicy.Placement == VersionPlacement.DedicatedAccounts
+            && !pool.Members.Any(m => m.IsEnabled && m.IsVersionStore))
+        {
+            await ShowErrorAsync("No account for versions",
+                "This pool keeps versions on dedicated accounts, so at least one account must be "
+                + "allowed to hold them. Nothing was changed.");
             return;
         }
 
@@ -894,6 +922,246 @@ public sealed partial class PoolsPage : Page
 
     private static long GbToBytes(double gb) =>
         double.IsNaN(gb) || gb <= 0 ? 0 : (long)(gb * 1024 * 1024 * 1024);
+
+
+    // ── Version policy ──────────────────────────────────────────────────
+
+    private async void EditVersions_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string poolId }) return;
+
+        var pool = await App.Store.GetPoolAsync(poolId);
+        if (pool == null) return;
+
+        var policy = pool.VersionPolicy;
+        var accounts = await App.Store.GetAllAccountsAsync();
+        var accountMap = accounts.ToDictionary(a => a.AccountId);
+
+        var panel = new StackPanel { Spacing = 12 };
+
+        panel.Children.Add(new InfoBar
+        {
+            Title = "Previous versions",
+            Message = "When a file is replaced, the copy it replaced is kept in a hidden folder "
+                    + "in your cloud storage rather than deleted. These settings apply to this "
+                    + "pool; anything left on \"Use global setting\" follows Settings → File versions.",
+            Severity = InfoBarSeverity.Informational,
+            IsOpen = true,
+            IsClosable = false
+        });
+
+        // ── On/off ───────────────────────────────────────────────
+        var enabledBox = new ComboBox
+        {
+            Header = "Keep previous versions",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ItemsSource = new[] { "Use global setting", "Yes", "No" },
+            SelectedIndex = policy.Enabled == null ? 0 : policy.Enabled == true ? 1 : 2
+        };
+
+        // ── Where they go ────────────────────────────────────────
+        var placementBox = new ComboBox
+        {
+            Header = "Where to keep them",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ItemsSource = new[]
+            {
+                "On the same account as the file",
+                "Spread across accounts",
+                "Only on accounts marked for versions"
+            },
+            SelectedIndex = (int)policy.Placement
+        };
+
+        var placementNote = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+        };
+
+        var strategyBox = new ComboBox
+        {
+            Header = "Which account to pick when spreading",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ItemsSource = new[] { "Same as the pool's strategy" }
+                .Concat(Enum.GetNames<PlacementStrategy>()).ToList(),
+            SelectedIndex = policy.PlacementStrategy == null
+                ? 0
+                : Array.IndexOf(Enum.GetNames<PlacementStrategy>(), policy.PlacementStrategy.Value.ToString()) + 1
+        };
+
+        var stripingBox = new ComboBox
+        {
+            Header = "Splitting versions across accounts",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            ItemsSource = new[]
+            {
+                "Keep the file's existing layout",
+                "Never split — store as one piece",
+                "Always split across accounts"
+            },
+            SelectedIndex = (int)policy.Striping
+        };
+
+        void UpdateNote()
+        {
+            bool needsTransfer = placementBox.SelectedIndex != (int)VersionPlacement.SameAccount
+                                 || stripingBox.SelectedIndex != (int)VersionStriping.Inherit;
+
+            placementNote.Text = needsTransfer
+                ? "Keeping a version will download the old copy and upload it to its new home, so "
+                  + "each edit costs bandwidth and takes time proportional to the file size."
+                : "Keeping a version just moves the old copy within the same account — no data is "
+                  + "transferred, so this is effectively free.";
+
+            strategyBox.Visibility = placementBox.SelectedIndex == (int)VersionPlacement.Balanced
+                ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        placementBox.SelectionChanged += (_, _) => UpdateNote();
+        stripingBox.SelectionChanged += (_, _) => UpdateNote();
+        UpdateNote();
+
+        // ── Limits ───────────────────────────────────────────────
+        var maxCountBox = new NumberBox
+        {
+            Header = "Versions to keep per file (-1 = use global, 0 = unlimited)",
+            Value = policy.MaxVersionsPerFile ?? -1,
+            Minimum = -1, Maximum = 1000,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+        };
+
+        var daysBox = new NumberBox
+        {
+            Header = "Delete versions older than (days, -1 = use global, 0 = never)",
+            Value = policy.RetentionDays ?? -1,
+            Minimum = -1, Maximum = 3650,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+        };
+
+        var totalSizeBox = new NumberBox
+        {
+            Header = "Total space versions may use in this pool (GB, 0 = no cap)",
+            Value = BytesToGb(policy.MaxTotalBytes),
+            Minimum = 0, Maximum = 100000,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+        };
+
+        var maxFileSizeBox = new NumberBox
+        {
+            Header = "Skip files larger than (GB, 0 = no limit)",
+            Value = BytesToGb(policy.MaxVersionSizeBytes),
+            Minimum = 0, Maximum = 100000,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+        };
+
+        var intervalBox = new NumberBox
+        {
+            Header = "Minimum minutes between versions of a file (0 = every change)",
+            Value = policy.MinIntervalMinutes,
+            Minimum = 0, Maximum = 10080,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
+        };
+
+        // ── Which accounts are version stores ────────────────────
+        var storeList = new StackPanel { Spacing = 4 };
+        var storeChecks = new List<(string AccountId, CheckBox Check)>();
+
+        foreach (var member in pool.Members.OrderBy(m => m.Priority))
+        {
+            var name = accountMap.TryGetValue(member.AccountId, out var acc) ? acc.DisplayName : member.AccountId;
+            var check = new CheckBox
+            {
+                Content = name + (member.ExcludeFromFilePlacement ? "  (no ordinary files)" : ""),
+                IsChecked = member.IsVersionStore
+            };
+            storeList.Children.Add(check);
+            storeChecks.Add((member.AccountId, check));
+        }
+
+        var storeSection = new StackPanel
+        {
+            Spacing = 6,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = "Accounts allowed to hold versions",
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    FontSize = 13
+                },
+                storeList
+            }
+        };
+
+        panel.Children.Add(enabledBox);
+        panel.Children.Add(placementBox);
+        panel.Children.Add(placementNote);
+        panel.Children.Add(strategyBox);
+        panel.Children.Add(stripingBox);
+        panel.Children.Add(storeSection);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Limits",
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            FontSize = 13,
+            Margin = new Thickness(0, 6, 0, 0)
+        });
+        panel.Children.Add(maxCountBox);
+        panel.Children.Add(daysBox);
+        panel.Children.Add(totalSizeBox);
+        panel.Children.Add(maxFileSizeBox);
+        panel.Children.Add(intervalBox);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"Versions: {pool.Name}",
+            Content = new ScrollViewer { Content = panel, MaxHeight = 520 },
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+        policy.Enabled = enabledBox.SelectedIndex switch { 1 => true, 2 => false, _ => null };
+        policy.Placement = (VersionPlacement)placementBox.SelectedIndex;
+        policy.Striping = (VersionStriping)stripingBox.SelectedIndex;
+        policy.PlacementStrategy = strategyBox.SelectedIndex <= 0
+            ? null
+            : Enum.Parse<PlacementStrategy>(Enum.GetNames<PlacementStrategy>()[strategyBox.SelectedIndex - 1]);
+
+        policy.MaxVersionsPerFile = ReadOptionalInt(maxCountBox);
+        policy.RetentionDays = ReadOptionalInt(daysBox);
+        policy.MaxTotalBytes = GbToBytes(totalSizeBox.Value);
+        policy.MaxVersionSizeBytes = GbToBytes(maxFileSizeBox.Value);
+        policy.MinIntervalMinutes = double.IsNaN(intervalBox.Value) ? 0 : (int)intervalBox.Value;
+
+        foreach (var (accountId, check) in storeChecks)
+            pool.Members.First(m => m.AccountId == accountId).IsVersionStore = check.IsChecked == true;
+
+        if (policy.Placement == VersionPlacement.DedicatedAccounts
+            && !pool.Members.Any(m => m.IsEnabled && m.IsVersionStore))
+        {
+            await ShowErrorAsync("No account for versions",
+                "Tick at least one account to hold versions, or choose a different place to keep them. "
+                + "Nothing was changed.");
+            return;
+        }
+
+        await App.Store.UpsertPoolAsync(pool);
+        ClouderLog.Info($"Updated version policy for pool '{pool.Name}': {policy.Placement}, {policy.Striping}");
+        await RefreshPoolsAsync();
+    }
+
+    /// <summary>Reads a NumberBox where -1 means "leave it to the global setting".</summary>
+    private static int? ReadOptionalInt(NumberBox box)
+    {
+        if (double.IsNaN(box.Value)) return null;
+        return box.Value < 0 ? null : (int)box.Value;
+    }
 
     // ── Merge Pools ─────────────────────────────────────────────────────
 

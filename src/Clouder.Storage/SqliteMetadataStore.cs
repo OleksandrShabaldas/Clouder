@@ -177,6 +177,21 @@ public sealed class SqliteMetadataStore : IMetadataStore
         }
         catch (SqliteException) { /* columns already exist */ }
 
+        try
+        {
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE pool_members ADD COLUMN is_version_store INTEGER NOT NULL DEFAULT 0", ct);
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE pool_members ADD COLUMN exclude_from_files INTEGER NOT NULL DEFAULT 0", ct);
+        }
+        catch (SqliteException) { /* columns already exist */ }
+
+        try
+        {
+            // The version policy is stored as JSON: it is a bag of optional settings that
+            // gains fields over time, and a column per knob would mean a migration each time.
+            await ExecuteNonQueryAsync(conn, "ALTER TABLE pools ADD COLUMN version_policy TEXT", ct);
+        }
+        catch (SqliteException) { /* column already exists */ }
+
         await ExecuteNonQueryAsync(conn, """
             CREATE TABLE IF NOT EXISTS conflicts (
                 conflict_id TEXT PRIMARY KEY,
@@ -488,17 +503,20 @@ public sealed class SqliteMetadataStore : IMetadataStore
         {
             cmd.Transaction = tx;
             cmd.CommandText = """
-                INSERT INTO pools (pool_id, name, local_path, mode, default_strategy)
-                VALUES (@id, @name, @path, @mode, @strategy)
+                INSERT INTO pools (pool_id, name, local_path, mode, default_strategy, version_policy)
+                VALUES (@id, @name, @path, @mode, @strategy, @versionPolicy)
                 ON CONFLICT(pool_id) DO UPDATE SET
                     name = excluded.name,
                     local_path = excluded.local_path,
                     mode = excluded.mode,
-                    default_strategy = excluded.default_strategy
+                    default_strategy = excluded.default_strategy,
+                    version_policy = excluded.version_policy
                 """;
             cmd.Parameters.AddWithValue("@id", pool.PoolId);
             cmd.Parameters.AddWithValue("@name", pool.Name);
             cmd.Parameters.AddWithValue("@path", pool.LocalPath);
+            cmd.Parameters.AddWithValue("@versionPolicy",
+                System.Text.Json.JsonSerializer.Serialize(pool.VersionPolicy));
             cmd.Parameters.AddWithValue("@mode", (int)pool.Mode);
             cmd.Parameters.AddWithValue("@strategy", (int)pool.DefaultStrategy);
             await cmd.ExecuteNonQueryAsync(ct);
@@ -518,9 +536,9 @@ public sealed class SqliteMetadataStore : IMetadataStore
             cmd.Transaction = tx;
             cmd.CommandText = """
                 INSERT INTO pool_members (pool_id, account_id, provider_id, priority, is_enabled, root_folder_id,
-                                          max_usage_bytes, reserve_bytes)
+                                          max_usage_bytes, reserve_bytes, is_version_store, exclude_from_files)
                 VALUES (@poolId, @accountId, @providerId, @priority, @enabled, @rootFolder,
-                        @maxUsage, @reserve)
+                        @maxUsage, @reserve, @versionStore, @excludeFiles)
                 """;
             cmd.Parameters.AddWithValue("@poolId", pool.PoolId);
             cmd.Parameters.AddWithValue("@accountId", member.AccountId);
@@ -530,6 +548,8 @@ public sealed class SqliteMetadataStore : IMetadataStore
             cmd.Parameters.AddWithValue("@rootFolder", (object?)member.RootFolderId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@maxUsage", member.MaxUsageBytes);
             cmd.Parameters.AddWithValue("@reserve", member.ReserveBytes);
+            cmd.Parameters.AddWithValue("@versionStore", member.IsVersionStore ? 1 : 0);
+            cmd.Parameters.AddWithValue("@excludeFiles", member.ExcludeFromFilePlacement ? 1 : 0);
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
@@ -1196,7 +1216,9 @@ public sealed class SqliteMetadataStore : IMetadataStore
                     ? null
                     : reader.GetString(reader.GetOrdinal("root_folder_id")),
                 MaxUsageBytes = ReadLongOrZero(reader, "max_usage_bytes"),
-                ReserveBytes = ReadLongOrZero(reader, "reserve_bytes")
+                ReserveBytes = ReadLongOrZero(reader, "reserve_bytes"),
+                IsVersionStore = ReadLongOrZero(reader, "is_version_store") == 1,
+                ExcludeFromFilePlacement = ReadLongOrZero(reader, "exclude_from_files") == 1
             });
         }
         return members;
@@ -1280,8 +1302,25 @@ public sealed class SqliteMetadataStore : IMetadataStore
         Name = reader.GetString(reader.GetOrdinal("name")),
         LocalPath = reader.GetString(reader.GetOrdinal("local_path")),
         Mode = (PoolMode)reader.GetInt32(reader.GetOrdinal("mode")),
-        DefaultStrategy = (PlacementStrategy)reader.GetInt32(reader.GetOrdinal("default_strategy"))
+        DefaultStrategy = (PlacementStrategy)reader.GetInt32(reader.GetOrdinal("default_strategy")),
+        VersionPolicy = ReadVersionPolicy(reader)
     };
+
+    private static VersionPolicy ReadVersionPolicy(SqliteDataReader reader)
+    {
+        var json = ReadStringOrNull(reader, "version_policy");
+        if (string.IsNullOrEmpty(json)) return new VersionPolicy();
+
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<VersionPolicy>(json) ?? new VersionPolicy();
+        }
+        catch
+        {
+            // A policy we can't read must not make the pool unusable.
+            return new VersionPolicy();
+        }
+    }
 
     private static AppNotification ReadNotification(SqliteDataReader reader) => new()
     {

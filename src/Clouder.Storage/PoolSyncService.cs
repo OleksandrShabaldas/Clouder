@@ -624,7 +624,7 @@ public sealed class PoolSyncService : IDisposable
 
         // Bail early with a clear message if no member account is currently connected.
         bool anyConnected = pool.Members
-            .Where(m => m.IsEnabled)
+            .Where(m => m.IsEnabled && !m.ExcludeFromFilePlacement)
             .Any(m => _providers.GetProvider(m.ProviderId) != null);
         if (!anyConnected)
         {
@@ -645,7 +645,7 @@ public sealed class PoolSyncService : IDisposable
 
         // Force striping for very large files if the user set a threshold.
         bool forceStripe = StripeThresholdBytes > 0 && fileSize > StripeThresholdBytes
-                           && pool.Members.Count(m => m.IsEnabled) >= 2;
+                           && pool.Members.Count(m => m.IsEnabled && !m.ExcludeFromFilePlacement) >= 2;
 
         // Decide placement
         var decision = await _poolManager.DecidePlacementAsync(pool.PoolId, fileName, fileSize, relativeDir, ct);
@@ -728,7 +728,7 @@ public sealed class PoolSyncService : IDisposable
             default:
                 // Fallback — upload to the highest priority enabled member.
                 var fallbackMember = pool.Members
-                    .Where(m => m.IsEnabled)
+                    .Where(m => m.IsEnabled && !m.ExcludeFromFilePlacement)
                     .OrderBy(m => m.Priority)
                     .FirstOrDefault();
                 if (fallbackMember != null)
@@ -1112,7 +1112,7 @@ public sealed class PoolSyncService : IDisposable
         if (poolId == null) return false;
         var pool = await _store.GetPoolAsync(poolId, ct);
         if (pool == null) return false;
-        if (pool.Members.Count(m => m.IsEnabled) < 2) return false;
+        if (pool.Members.Count(m => m.IsEnabled && !m.ExcludeFromFilePlacement) < 2) return false;
 
         var plans = await _poolManager.BuildStripePlanForAsync(poolId, item.Size, ct);
         if (plans.Count < 2) return false;
@@ -1162,7 +1162,8 @@ public sealed class PoolSyncService : IDisposable
             var relativeDir = Path.GetDirectoryName(relativePath);
             var decision = await _poolManager.DecidePlacementAsync(poolId, item.Name, item.Size, relativeDir, ct);
             var target = decision.TargetAccountId
-                ?? pool.Members.Where(m => m.IsEnabled).OrderBy(m => m.Priority).FirstOrDefault()?.AccountId;
+                ?? pool.Members.Where(m => m.IsEnabled && !m.ExcludeFromFilePlacement)
+                       .OrderBy(m => m.Priority).FirstOrDefault()?.AccountId;
             if (target == null) return false;
 
             await DeleteCloudCopyAsync(item, ct);            // remove chunks, clears plans

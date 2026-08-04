@@ -519,7 +519,13 @@ public sealed class StoragePoolManager : IStoragePoolManager
         var pool = await _store.GetPoolAsync(poolId, ct)
             ?? throw new InvalidOperationException($"Pool '{poolId}' not found");
 
-        var enabled = pool.Members.Where(m => m.IsEnabled).ToList();
+        // Accounts set aside for version history are not candidates for ordinary files.
+        // Note this is the state used for placement, striping and reorganization alike,
+        // so an excluded account is skipped by every path that could put a file on it.
+        var enabled = pool.Members
+            .Where(m => m.IsEnabled && !m.ExcludeFromFilePlacement)
+            .ToList();
+
         var members = new List<PoolMember>();
         var quotas = new Dictionary<string, StorageQuota>();
         var effectiveFree = new Dictionary<string, long>();

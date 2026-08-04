@@ -128,6 +128,13 @@
                                         <TextBlock Text="Accounts" FontSize="12" />
                                     </StackPanel>
                                 </Button>
+                                <Button Tag="{Binding PoolId}" Click="EditVersions_Click"
+                                        ToolTipService.ToolTip="Where and how long previous versions are kept">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <FontIcon Glyph="&#xE81C;" FontSize="12" />
+                                        <TextBlock Text="Versions" FontSize="12" />
+                                    </StackPanel>
+                                </Button>
                                 <Button Tag="{Binding PoolId}" Click="EditPool_Click" ToolTipService.ToolTip="Edit pool settings">
                                     <FontIcon Glyph="&#xE70F;" FontSize="12" />
                                 </Button>

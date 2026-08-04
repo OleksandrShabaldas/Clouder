@@ -22,6 +22,9 @@ public sealed class StoragePool
     public List<PoolMember> Members { get; set; } = [];
     public PoolMode Mode { get; set; } = PoolMode.Auto;
     public PlacementStrategy DefaultStrategy { get; set; } = PlacementStrategy.FillFirst;
+
+    /// <summary>How this pool keeps previous copies of its files.</summary>
+    public VersionPolicy VersionPolicy { get; set; } = new();
 }
 
 public sealed class PoolMember
@@ -55,4 +58,16 @@ public sealed class PoolMember
     /// for whatever else lives in that cloud storage.
     /// </summary>
     public long ReserveBytes { get; set; }
+
+    /// <summary>
+    /// This account may hold previous versions when the pool's placement is
+    /// <see cref="VersionPlacement.DedicatedAccounts"/>.
+    /// </summary>
+    public bool IsVersionStore { get; set; }
+
+    /// <summary>
+    /// Keep ordinary files off this account. Combined with <see cref="IsVersionStore"/>
+    /// it turns an account into an archive that live files never touch.
+    /// </summary>
+    public bool ExcludeFromFilePlacement { get; set; }
 }
